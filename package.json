@@ -1,8 +1,7 @@
 {
   "name": "vali-mock",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Study mock of long-running nurse-staffing AI agents: LangGraph.js, Postgres, RabbitMQ, memory, human-in-the-loop",
   "directories": {
     "doc": "docs"
   },
@@ -11,15 +10,12 @@
     "typecheck": "tsc",
     "seed": "tsx src/seed.ts",
     "demo": "tsx src/demo.ts",
-    "services": "tsx src/services.ts",
-    "gateway": "tsx src/gateway.ts"
+    "services": "tsx src/services.ts"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/shyamhq/basic.git"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/shyamhq/basic/issues"
