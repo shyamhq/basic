@@ -1,0 +1,48 @@
+{
+  "name": "vali-mock",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc",
+    "seed": "tsx src/seed.ts",
+    "demo": "tsx src/demo.ts",
+    "services": "tsx src/services.ts",
+    "gateway": "tsx src/gateway.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shyamhq/basic.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/shyamhq/basic/issues"
+  },
+  "homepage": "https://github.com/shyamhq/basic#readme",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.12.0",
+    "@hono/node-server": "^2.1.11",
+    "@langchain/core": "^1.5.0",
+    "@langchain/langgraph": "^1.7.5",
+    "@langchain/langgraph-checkpoint-postgres": "^1.1.4",
+    "amqplib": "^2.4.1",
+    "hono": "^4.13.20",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}
