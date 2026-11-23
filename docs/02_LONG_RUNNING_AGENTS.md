@@ -4,130 +4,122 @@ A shift-fill run lasts **minutes to a day**. In that time nurses reply whenever 
 humans approve slowly, deploys happen and pods die. "Long-running" means the agent's
 **progress lives in the database, not in a process**.
 
-## 1. Checkpoints: the agent's short-term memory
-`graph.invoke(..., { durability: "sync" })` with `PostgresSaver` writes a checkpoint after
-**every super-step**: state values, the next nodes, and pending writes.
+## 1. Checkpoints: the source of truth
+`graph.invoke(..., { durability: "sync" })` with `PostgresSaver` writes a checkpoint after **every
+super-step**: state values, the next nodes, and pending writes.
+- `durability`: `"sync"` persists before the next step starts (safest). `"async"` overlaps the write with the next step. `"exit"` writes only at the end or at an interrupt.
+- `getState()` gives values, `next` and `tasks[].interrupts`. `getStateHistory()` gives every checkpoint (`GET /api/threads/:id/history`).
+- **Everything else is a projection of the checkpoint.** `agent_runs.status/waiting_for` and the
+  `approvals` inbox are recomputed by `project()` at the start of **every** drain. A crash between
+  `invoke()` and our bookkeeping heals on the next pass. Test 17 crashes exactly there.
 
-- `durability: "sync"` → the checkpoint is persisted before the next step starts (safest).
-  `"async"` overlaps writing with the next step (faster; a crash can lose the last step).
-  `"exit"` writes only at the end or at an interrupt (fastest; least durable).
-- `getState(cfg)` → current values, `next`, and `tasks[].interrupts`.
-- `getStateHistory(cfg)` → every checkpoint ("time travel", audit, debugging). See `GET /api/threads/:id/history`.
-
-> **Checkpointing is not full durable execution.** LangGraph saves state *between*
-> nodes. If a process dies *inside* a node, that node re-runs from the top. That's why
-> side effects need idempotency keys (§5). Temporal-style engines also record
-> *activity results* inside a step, which is the main difference to mention.
+> Checkpointing is not full durable execution. LangGraph saves state *between* nodes. A process that
+> dies *inside* a node re-runs that node from the top. Hence §5. Temporal-style engines also journal
+> each activity result inside a step, which is the difference to name in an interview.
 
 ## 2. `interrupt()`: pausing without holding anything
 ```ts
-const ev = interrupt({ type: "wait_event", accepts: ["nurse_reply", "timer"] });
+const ev = interrupt({ type: "wait_event", accepts: ["nurse_reply", "timer", "cancel"] });
 ```
-- The first time through, `interrupt` throws a special signal. LangGraph saves the
-  checkpoint and returns `__interrupt__` to the caller. **The worker is now free.**
-- To resume, call `graph.invoke(new Command({ resume: value }), cfg)`. The **whole node
-  re-runs from its first line**, and this time `interrupt()` *returns* `value`.
-- Consequences (see the rules at the top of `shiftFill.ts`):
-  - Put `interrupt()` first. Side effects go *after* it, or must be idempotent
-    (`emergency` in `intake.ts` deliberately pages *before* the interrupt and relies on the
-    tool's idempotency key, and test 6 proves the page goes out only once).
-  - Several `interrupt()` calls in one node are matched **by order**. Don't put them in
-    conditional loops; loop with edges instead (`wait → handle_event → wait`).
-- Each interrupt payload declares `accepts`, which is the contract the worker uses to choose
-  which mailbox event may resume it.
+- **First pass**: `interrupt` throws a signal. LangGraph saves the checkpoint and the run ends. **The worker is free.**
+- **Resume**: `invoke(new Command({ resume: value }))` re-runs the **whole node** from line one, and this time `interrupt()` returns `value`.
+- **Interrupt ids**: an id is stable across re-runs of the same pause and new for each new pause. The worker relies on this, both to reconcile and to guard against stale decisions.
+- **Rules** (top of `shiftFill.ts`):
+  - Put `interrupt()` first.
+  - Side effects go after it, or must be idempotent. `emergency` pages *before* its interrupt and relies on the tool key (test 8).
+  - Loop with edges (`wait → interpret → handle_event → wait`), never with `interrupt()` inside a loop.
+- **Non-determinism**: an LLM may classify the same text differently on a replay. So the model call
+  lives in its own node (`interpret`), and its output is checkpointed *before* `handle_event` decides
+  and writes anything.
+- Every interrupt payload declares `accepts`: the contract the worker uses to pick which mailbox event may resume it.
 
-## 3. The mailbox (actor model)
-Every stimulus goes to `thread_inbox` first, then a `thread.kick` job.
-`drainMailbox` (`src/worker.ts`) then decides:
+## 3. The mailbox (actor model) + reconciliation
+Every stimulus lands in `app.thread_inbox`, together with a kick job, in one transaction.
+`processThread` (`src/worker.ts`) then loops:
 
-| Thread state | Action |
+| Step | What |
 |---|---|
-| No checkpoint yet | `invoke(start input)` |
-| Paused at an interrupt | Oldest pending event whose `kind ∈ accepts` → `invoke(Command({resume}))` |
-| Has `next` but no interrupt | It **crashed mid-run** → `invoke(null)` continues from the last checkpoint |
-| Finished | Leftover events → `ignored` (late nurse replies get a polite SMS) |
+| lease | `lease_version += 1`. Every control-plane write below is conditional on it (fencing token) |
+| reconcile | Each `inflight` event becomes `consumed` if the checkpoint moved past `resumed_interrupt_id`; otherwise it goes back to `pending` |
+| project | Rebuild run status and approvals from the current interrupt; close approvals for pauses the thread left |
+| pick | No checkpoint → `start`. Paused → oldest pending event whose `kind ∈ accepts`. Next tasks but no pause → it crashed mid-run → `invoke(null)`. Finished → close leftovers |
+| invoke | Mark the event `inflight` + interrupt id, then `invoke` |
 
 Why not resume straight from the webhook?
-- **Buffering.** A nurse texts while the thread waits on a human approval. The approval
-  interrupt doesn't accept `nurse_reply`, so the event waits its turn (test 11).
-- **Ordering and serialization.** One thread processes one event at a time, in order.
-- **Dedupe.** `dedupe_key` is unique (provider retries, double clicks).
-- **Debuggability.** The mailbox *is* the thread's input log.
+- **Buffering**: a nurse texts while the thread waits on a human; the approval doesn't accept `nurse_reply`, so the event waits (test 14).
+- **Ordering**: one event at a time per thread.
+- **Dedupe**: `dedupe_key` is unique.
+- **Debuggability**: the mailbox is the thread's input log.
+- **Double texting**: a follow-up text joins the open conversation as `nurse_message` (test 4). LangGraph Platform calls the strategies reject / enqueue / interrupt / rollback; this is "enqueue".
 
-## 4. One worker per thread at a time: advisory locks
-`pg_try_advisory_lock(hashtext(thread_id))` is held on a dedicated connection for the run.
-- If another worker holds it, throw `RetryLater` and the job goes to `agent.jobs.delay` (TTL 2s) → back.
-- If the worker dies, its DB session ends and Postgres **releases the lock automatically**.
-  Compare a Redis lock, which needs a TTL and fencing tokens.
-- Kafka alternative: partition by `thread_id`, so one consumer owns a partition.
+## 4. One worker per thread: named queues + a lease
+- graphile-worker runs jobs of the queue `thread:<id>` **one at a time**, so two workers never drain the same thread.
+- `job_key = kick:<id>` coalesces duplicate kicks. If a kick arrives while one is running, a new job is queued behind it, so no wake-up is lost.
+- **Fencing**: no lock is perfect. If a worker is presumed dead and its job force-unlocked, but it was only slow, two runs could overlap.
+  - `lease_version` stops the zombie's control-plane writes (`LostLease`).
+  - LangGraph's checkpoint writes aren't fenced: the saver doesn't compare-and-set. Say that honestly.
+  - Kafka gets this from partition ownership; Temporal gets it from its event history.
+- **Reaper** (`reapDeadRuns`): if a run sits in `running` with a stale heartbeat, its worker died. graphile would only unlock that job after 4h, so the reaper calls `force_unlock_workers` and re-kicks (test 23).
 
-## 5. Idempotency everywhere (at-least-once world)
+## 5. Idempotency and exactly-once where it matters
 | Layer | Mechanism |
 |---|---|
-| Webhooks | `inbound_requests` unique key (`sms:<messageId>`, `retell:<call_id>`) |
-| Mailbox | `thread_inbox.dedupe_key` unique |
-| Outbox | `outbox.dedupe_key` unique |
-| Tools | `tool_calls.idempotency_key` = `<thread>:<purpose>` (deterministic), so a re-run returns the cached result |
-| Timers | deterministic ids `<thread>:wave:<n>`, `ON CONFLICT DO NOTHING` |
-| Offers | deterministic code from `hash(thread, caregiver)` |
-| Graph | `seenEvents` in state (idempotent consumer), wave number on timers (stale timer ignored, test 14) |
-| HITL | approval `status` checked `FOR UPDATE` (409 on double click), `interruptId` must match the current interrupt |
+| Webhooks | `inbound_requests` key (`sms:<messageId>`, `retell:<call>:analyzed`) |
+| Meaning-level dedupe | Retell mid-call `accept_shift` and post-call `call_analyzed` both use `offer:<code>:accept` → one acceptance (test 29) |
+| Mailbox / jobs | `dedupe_key` unique / `job_key` |
+| Internal tools | Claim + effect + result in **one transaction** → exactly-once (`book_shift`; test 19 crashes inside it) |
+| External tools | Claim → call → record: **at-least-once** (a provider can't join our transaction). Use provider idempotency keys where they exist |
+| Graph writes | `offers.last_event_id`: a transition applies if the offer is in the expected state **or was moved by this same event**, so a replayed node takes the same branch (test 18) |
+| Timers | Deterministic ids (`<thread>:wave:<n>`), `ON CONFLICT DO NOTHING`; wave number carried on the timer (stale ones are ignored, test 22) |
+| Invariants | The DB, not the agent: EXCLUDE constraint `no_overlapping_bookings` (test 20), natural thread ids `fill:<shiftId>` |
 
-Test 13 crashes *after* the booking API call but *before* the node finishes. On recovery
-the node re-runs and the tool gateway returns the cached result. Result: one booking,
-one confirmation SMS, and the nurse's hours bumped once.
-
-## 6. The transactional outbox
-Never "write the DB, then publish". Write both in **one transaction** (the outbox row is the
-"publish"). `relayOnce` publishes with `FOR UPDATE SKIP LOCKED`, so many relays are safe. If a
-relay crashes between publishing and commit, the message is sent twice, which is fine
-because every consumer is idempotent. To lower latency, use `LISTEN/NOTIFY` or CDC
-(Debezium) instead of polling.
+## 6. Transactional enqueue (the outbox, built in)
+The dual-write problem: `db.update(); queue.publish()`. A crash in between either loses the job or
+creates a job for a change that never happened. With graphile-worker, `add_job` runs **in the same
+transaction** as the state change, so the jobs table *is* the outbox and there's no relay.
+`src/reference/rabbitmq.ts` shows the classic version: an `outbox` table + `relayOnce`
+(`FOR UPDATE SKIP LOCKED`) + RabbitMQ. You need that when consumers live outside Postgres (Go
+services, other teams) or the queue must fan out to many consumer types.
 
 ## 7. Durable timers
-A `setTimeout` dies with the pod. `timers` rows survive deploys. `fireDueTimers` claims due
-rows with `SKIP LOCKED` and delivers `{kind:"timer"}` to the mailbox. Timers used here:
-wave timeout, hard deadline (2h before shift start), approval SLA (`escalateStaleApprovals`).
-At large scale: bucketed timer wheels, or the delayed messages of SQS or Temporal.
+- A `setTimeout` dies with the pod; a timer row survives deploys.
+- The cron job `timers_tick` runs every minute. `fireDueTimers` claims due rows with `SKIP LOCKED` and delivers `{kind:"timer"}` to the mailbox in the same transaction.
+- Timers here: wave timeout, hard deadline (2h before start), the parent's children deadline, and the approval SLA.
+- Why a table and not graphile `run_at` jobs? Timers are domain state: the UI can show the next wave, tests can fast-forward the clock, and the graph cancels them by id.
 
 ## 8. Failure handling ladder
-1. **In-node retry**: `retryPolicy: { maxAttempts: 3 }` on `load_shift`, `send_wave`, `classify`
-   (transient API errors, with backoff and jitter).
-2. **Job retry**: the worker throws → bus re-publishes to `.delay` with `attempt+1`.
-3. **Dead-letter**: after `MAX_JOB_ATTEMPTS`, the job goes to `.dlq`, the `dead_letters` row
-   is written, the run is marked `failed` and a **human is paged** (`onDeadJob`). Test `rabbit.test.ts` covers this.
-4. **Reaper**: a run stuck in `running` with a stale heartbeat means the process died →
-   re-kick → `invoke(null)` (test 13).
-5. **Business conflicts** (`ToolConflict`, e.g. the shift was filled elsewhere) are *not*
-   retried. The graph handles them (`book` → `filled_elsewhere`).
+1. **In-node retry**: `retryPolicy: { maxAttempts: 3 }` on `load_shift`, `send_wave`, `interpret`, `classify`.
+2. **Job retry**: graphile retries with exponential backoff (`max_attempts = 5`).
+3. **Dead letter**: on the last attempt, `onThreadDead`, in one transaction:
+   - mark the run failed;
+   - cancel its approvals;
+   - enqueue a page to a human;
+   - deliver `child_done{failed}` to the parent, so its fan-in never hangs (test 21).
+4. **Reaper** for workers that vanished (§4).
+5. **Business conflicts** (`ToolConflict`: shift taken, nurse double-booked) are not retried. The graph routes them: an overlap moves on to the next nurse; a shift that's gone finishes the thread.
 
-## 9. Deploying new code while threads are paused (versioning)
-Threads may sit at an interrupt for hours across a deploy. Checkpoints store **state and
-node names**, not code. Rules of thumb:
-- Never rename or remove a node that live threads may be paused in. Add new nodes and keep
-  old ones as shims until in-flight threads drain.
-- Make state changes additive and optional (new keys with defaults).
-- Put a `graphVersion` on `agent_runs`, run old versions side by side or migrate state
-  explicitly, and alert on threads paused in unknown nodes. (A third-party report says a
-  pending interrupt can be silently dropped after a node rename, so test this.)
+## 9. Deploying new code while threads are paused
+- `agent_runs.graph_version` + `getGraph(name, version)`: a paused thread resumes on the code it started with.
+- Bump the version for breaking changes: a renamed or removed node, or a changed state shape. Keep the old compiled graph registered until no thread uses it. A missing version throws loudly, which should alert someone.
+- State changes should be additive, with defaults.
+- **Retention**: the daily `checkpoint_retention` job deletes checkpoints of threads done more than 30 days ago (privacy + cost).
 
 ## 10. Queue choice cheat-sheet
-| | RabbitMQ (here) | Kafka | SQS | Postgres queue (pg-boss) |
+| | graphile-worker (here) | RabbitMQ (reference) | Kafka | SQS |
 |---|---|---|---|---|
-| Model | Jobs, per-message ack | Ordered log, offsets | Jobs | Jobs in a table |
-| Retry/DLQ | TTL + dead-letter exchange | DIY (retry topics) | Built-in redrive | Built-in |
-| Ordering | Per queue (weak with many consumers) | Per partition key | FIFO queues | Per query |
-| Replay | No | Yes | No | Kind of |
-| Use for | Agent jobs, memory jobs | Telemetry, audio chunks, event sourcing, many consumers | Managed jobs on AWS | Small or medium scale, fewer moving parts |
+| Enqueue atomic with DB change | **Yes** (SQL function) | Needs an outbox | Needs an outbox / CDC | Needs an outbox |
+| Per-key ordering | Named queue | Lock or consistent hashing | Partition key | FIFO group id |
+| Retry / DLQ | Built-in backoff, failed jobs kept | TTL + dead-letter exchange | DIY retry topics | Redrive policy |
+| Replay | No | No | **Yes** | No |
+| Best for | Postgres-centric apps up to high thousands of jobs/s | Polyglot job consumers | Event streams, audio chunks, many consumer groups | Managed AWS jobs |
 
 ## 11. Compared with durable-execution engines
 | | This mock (LangGraph + harness) | Temporal | Mastra workflows |
 |---|---|---|---|
-| Unit of durability | Super-step checkpoint | Every activity result (event history) | Workflow snapshot on suspend |
+| Unit of durability | Super-step checkpoint | Every activity result | Snapshot on suspend |
 | Waiting for humans/events | `interrupt()` + mailbox | Signals + `await condition` | `suspend()` / `resume()` |
-| Timers | `timers` table | Built-in durable timers | Sleep / scheduling primitives |
-| You must build | Mailbox, locks, outbox, timers, reaper | Workers + activities | Storage adapter, triggers |
+| Timers | `timers` table + cron | Built-in | Scheduling primitives |
+| You build | Mailbox, reconciliation, projections, timers, reaper | Workers + activities | Storage adapter, triggers |
 
-In one line: LangGraph gives you the **agent brain** and its state. The harness around it
-(mailbox, outbox, timers, locks, reaper) gives you **durability in the real world**.
-That's what "built the agent harness from scratch" means.
+In one line: LangGraph is the agent's **brain and state**; the harness around it makes it
+**durable in the real world**. That's what "built the agent harness from scratch" means.

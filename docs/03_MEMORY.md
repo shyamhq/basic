@@ -17,15 +17,21 @@
 
 ## Write path (asynchronous, off the hot path)
 ```
-SMS / call transcript ──► graph enqueues memory.extract (outbox, dedupe key = event id)
-                              ──► memory worker: extractPreferences (LLM / heuristic, zod schema)
+SMS / call transcript ──► job memory_extract (job_key = event id; queue memory:<caregiverId>)
+                              ──► extractPreferences (LLM / heuristic, zod schema)
                               ──► upsertPreference (conflict rules)
-ShiftFill.finish ──► memory.episode per nurse contacted (key = thread:caregiver → idempotent)
-Human reject + reason ──► memory.reflect ──► reflect() ──► addProcedure (rule)
-Hourly ──► memory.consolidate
+ShiftFill.finish ──► job memory_episode per nurse contacted (key = thread:caregiver → idempotent),
+                     enqueued in the SAME transaction as the thread's final bookkeeping
+Human reject + reason ──► job memory_reflect ──► reflect() ──► addProcedure (rule)
+cron hourly ──► consolidate_all ──► memory_consolidate per agency ──► memory_upsert_pref per nurse
 ```
 Why async? Extraction is an LLM call. The nurse's reply should move the shift forward
 immediately; learning can lag by a second. A failed extraction also never blocks a booking.
+
+Why a **queue per caregiver**? `upsertPreference` reads, compares authority, then writes. Two
+writers for the same nurse (an extraction and a consolidation promotion) could interleave and let
+an inference overwrite what she said. With all memory writes for a nurse in the named queue
+`memory:<caregiverId>`, they run one at a time. The ordering comes from the queue, so there's no lock in the code.
 
 ## Read path (before decisions)
 `recallForShift` (in `find_candidates`) gets, per candidate, their **preferences** (exact namespace
@@ -35,30 +41,31 @@ filter on `caregiverId`). It also gets the agency's **procedures** and the facil
 How each memory type is used:
 | Memory | Used in | Effect |
 |---|---|---|
-| Hard preference | `find_candidates` | **Excludes** the nurse, and says why in the log (test 15) |
+| Hard preference | `find_candidates`, re-checked in `prepare_wave` | **Excludes** the nurse and says why; a preference learned mid-thread applies to the next wave (test 25) |
 | Soft preference | `score_candidate` | ±3 / +2 points |
-| Episodes | `score_candidate` | +1 "worked here before", −1 "declined here before" (test 16) |
+| Episodes | `score_candidate` | +1 "worked here before", −1 "declined here before" (test 26) |
 | Channel / contact-hour preference | `score_candidate` | Call vs SMS; no calls before her hour |
 | Facts + notes | `handle_event` (questions), Retell variables | Answers "where do I park?" |
-| Procedures | `check_policy` (structured rule), `classify` (prompt text) | New approval gate (test 5) |
+| Procedures | `check_policy` (structured rule, read fresh), `classify` (prompt text) | New approval gate (test 7) |
 | All prefs as text | `send_wave` → Retell `known_preferences` | The voice agent knows her preferences |
 
 ## Conflict resolution
 `upsertPreference`:
 - **Authority**: `staff (3) > nurse_stated (2) > inferred (1)`. An inference never overwrites
-  what the nurse said (test 17).
+  what the nurse said (test 27).
 - **Single-valued types** (`channel`, `contact_after_hour`, `min_rate`) use one key, so the newest
   value replaces the old one and the old value is kept in `previous`. Multi-valued types use the key `type:value`.
 - **Hard vs soft**: something stated explicitly ("I don't do nights anymore") is hard. A hedged
   statement or a learned pattern is soft.
 
 ## Consolidation (the "sleep" job)
-`consolidate(agencyId)`:
-1. **Forget**: delete episodes older than 90 days. Privacy and relevance both improve.
-2. **Promote**: ≥2 `declined`/`no_response` for the same shift time → soft `avoid_shift_time` (inferred).
+`consolidate(agencyId)`, run by the hourly cron:
+1. **Scan** every episode, page by page (it doesn't stop at the first 1,000).
+2. **Forget**: delete episodes older than 90 days, after paging. Privacy and relevance both improve.
+3. **Promote**: ≥2 `declined`/`no_response` for the same shift time → soft `avoid_shift_time` (inferred).
    ≥2 `assigned` at the same facility → soft `prefer_facility`.
-3. **Respect authority**: promotion goes through `upsertPreference`, so it can't override a
-   stated preference.
+4. **Respect authority**: each promotion becomes a `memory_upsert_pref` job in that nurse's queue and
+   goes through `upsertPreference`, so it can't override a stated preference, and it can't race one.
 
 It's deterministic on purpose: easy to test and explain. In production an LLM can summarize
 clusters of episodes into one fact, which is the step where episodic memory becomes semantic memory.
@@ -85,7 +92,10 @@ pgvector and move when recall or latency SLOs force it.
   text, as instructions; quote memory as data; let structured rules (not free text) drive policy.
 - **Stale or wrong memories**: provenance, `updatedAt`, decay, and an easy "forget"/edit UI for staff.
 - **PII / HIPAA**: minimize what you store (preferences, not health details), keep retention
-  limits, encrypt, and scope per tenant.
+  limits, encrypt, and scope per tenant. Checkpoints are memory too. The graph state keeps **ids and
+  scores, not phone numbers or bios**: contact details are looked up when a message is sent. The daily
+  `checkpoint_retention` job deletes old threads' checkpoints, so "forget me" doesn't mean digging
+  through serialized blobs.
 - **Evaluating memory**: replay past threads with and without memory (fill rate, time-to-fill,
   number of messages sent, "annoyed nurse" rate). Unit-test extraction with labeled messages.
 

@@ -6,96 +6,83 @@ retry in waves, negotiate, **ask a human before anything risky**, book the shift
 in the facility's system, and **remember** what they learn.
 
 It's built to be read, not deployed: flat files, plain functions, lots of comments.
-The architecture is real, though. It covers durable execution, a mailbox per thread,
-outbox, durable timers, per-thread locks, idempotent tools, retries and DLQ,
-four types of long-term memory, and six kinds of human-in-the-loop (HITL).
-**20 scenario tests** prove each piece works.
+The architecture is real, though, and it went through a principal-engineer review. The 9
+high-severity bugs that review reproduced each have a regression test now.
+**30 scenario tests** run against real Postgres and a real job queue.
+
+## Stack
+| Concern | Library | Notes |
+|---|---|---|
+| Agent state machines | **LangGraph.js** | `interrupt`, `Command`, `Send`, Postgres checkpointer, `PostgresStore` (pgvector) |
+| App tables | **Drizzle ORM** + drizzle-kit | All in Postgres schema `app`; LangGraph keeps `public`, the queue keeps `graphile_worker` |
+| Jobs | **graphile-worker** | Enqueued *inside* the business transaction; a named queue per thread runs it one job at a time; retries; cron |
+| HTTP | **Hono** + `@hono/zod-validator` | Webhooks, approvals inbox, console UI |
+| LLM | **Anthropic SDK** (`claude-opus-5-5`) | Structured outputs; offline fallback rules when there's no key |
+| Voice | **Retell** adapter + local simulator | Outbound calls with memory in the prompt; post-call webhook |
+| Logs / tests | pino · vitest | |
+| Reference only | RabbitMQ (`amqplib`) + transactional outbox | `src/reference/rabbitmq.ts`: what you'd use with non-Postgres consumers |
 
 ## Quick start
-
 ```bash
-docker compose up -d          # Postgres (pgvector) + RabbitMQ (UI on :15672, guest/guest)
+docker compose up -d          # Postgres (pgvector) + RabbitMQ (only the reference test uses it)
 npm install
-npm run seed                  # 2 facilities, 8 nurse profiles, shifts
-npm run demo                  # narrated end-to-end story in your terminal (no network needed)
-npm test                      # 20 scenario tests (real Postgres; RabbitMQ test auto-skips if it's down)
-npm run services              # the real thing: gateway + workers + relay + scheduler over RabbitMQ
-open http://localhost:3000    # console: be the nurse (SMS simulator) + approvals inbox
+npm run seed                  # runs all migrations, seeds 2 facilities, 8 nurse profiles, shifts
+npm run demo                  # narrated end-to-end story (incl. a crash and recovery)
+npm test                      # 30 scenarios + 2 RabbitMQ reference tests
+npm run services              # gateway + workers + cron; console at http://localhost:3000
+npm run db:studio             # browse the app tables (drizzle-kit studio)
 ```
-
-There's no LLM key? No problem. Every model call has an offline fallback, so everything
-runs as is. Set `ANTHROPIC_API_KEY` to use Claude (`claude-opus-5-5`) for triage, reply
-parsing, memory extraction and reflection. For real phone calls, set
-`COMMS_PROVIDER=retell` plus the `RETELL_*` vars in `.env.example`.
+No LLM key is needed. Set `ANTHROPIC_API_KEY` to use Claude, or set `COMMS_PROVIDER=retell`
+plus the `RETELL_*` vars for real phone calls (see `.env.example`).
 
 ## Reading order (about 2 hours)
-
 | # | Read | You'll learn |
 |---|---|---|
-| 1 | `npm run demo` output | The whole story in one screen |
-| 2 | [docs/01_ARCHITECTURE.md](docs/01_ARCHITECTURE.md) | Components, the life of one SMS, data model |
-| 3 | `src/graphs/shiftFill.ts` | The long-running agent: waves, `interrupt()`, `Command`, `Send`, approval gate |
-| 4 | `src/graphs/intake.ts` | Supervisor: triage, safety rails, fan-out to child threads, fan-in |
-| 5 | `src/worker.ts` | Mailbox drain, per-thread lock, crash recovery, HITL inbox rows |
-| 6 | `src/outbox.ts`, `src/bus.ts`, `src/timers.ts` | Outbox, RabbitMQ retry/DLQ, durable timers, reaper |
+| 1 | `npm run demo` output | The whole story on one screen |
+| 2 | [docs/01_ARCHITECTURE.md](docs/01_ARCHITECTURE.md) | Components, the life of one SMS, data model, key choices |
+| 3 | `src/graphs/shiftFill.ts` | The long-running agent: waves, `interrupt()`, `Command`, `Send`, approval gate, replay safety |
+| 4 | `src/graphs/intake.ts` | Supervisor: triage, safety rails, fan-out to child threads, fan-in, double texting |
+| 5 | `src/worker.ts` | Draining the mailbox; the checkpoint as source of truth; reconciliation; lease |
+| 6 | `src/mailbox.ts`, `src/jobs.ts`, `src/tasks.ts`, `src/timers.ts` | Transactional enqueue, per-thread queues, cron, durable timers, reaper |
 | 7 | [docs/02_LONG_RUNNING_AGENTS.md](docs/02_LONG_RUNNING_AGENTS.md) | Why each reliability piece exists |
-| 8 | `src/memory.ts` + [docs/03_MEMORY.md](docs/03_MEMORY.md) | Profile / preference / episodic / semantic / procedural memory |
-| 9 | `src/tools.ts`, `src/llm.ts` | Tool gateway (risk tiers, idempotency, audit), LLM gateway (schemas, fallbacks) |
-| 10 | [docs/04_HUMAN_IN_THE_LOOP.md](docs/04_HUMAN_IN_THE_LOOP.md) | Six HITL patterns, and learning from corrections |
-| 11 | `tests/scenarios.test.ts` | 19 stories that prove it all; read them like a script |
-| 12 | [docs/05_INTERVIEW_QA.md](docs/05_INTERVIEW_QA.md) | Your Vali story, 40+ Q&A, a system-design walkthrough |
-| 13 | [docs/06_ADALAT_AI.md](docs/06_ADALAT_AI.md) | Mapping all of this to Adalat AI (courts, transcription, judge-in-the-loop) |
+| 8 | `src/memory.ts` + [docs/03_MEMORY.md](docs/03_MEMORY.md) | Profile, preference, episodic, semantic and procedural memory |
+| 9 | `src/tools.ts`, `src/llm.ts` | Tool gateway (risk tiers, exactly-once booking, audit); LLM gateway |
+| 10 | [docs/04_HUMAN_IN_THE_LOOP.md](docs/04_HUMAN_IN_THE_LOOP.md) | Six HITL patterns, per-kind decision validation, learning from corrections |
+| 11 | `src/db/schema.ts`, `drizzle/0001_invariants.sql` | The ORM schema; invariants enforced by the database |
+| 12 | `tests/scenarios.test.ts` | 30 stories that prove it all; read them like a script |
+| 13 | [docs/05_INTERVIEW_QA.md](docs/05_INTERVIEW_QA.md) | Your Vali story, Q&A, system-design walkthrough, review findings |
+| 14 | [docs/06_ADALAT_AI.md](docs/06_ADALAT_AI.md) | Mapping all of this to Adalat AI |
 
 ## File map
-
 ```
 src/
-  config.ts        knobs (wave size, timeouts, overtime, SLA)
-  clock.ts         controllable clock (tests fast-forward time)
-  db.ts            Postgres pool + the whole schema (domain + control plane)
-  outbox.ts        transactional outbox, mailbox delivery, startThread
-  bus.ts           RabbitMQ topology (work queues, delay queues, DLQ) + in-memory bus
-  llm.ts           LLM gateway: Claude structured outputs + offline heuristics
-  memory.ts        long-term memory on LangGraph PostgresStore + pgvector, consolidation
-  comms.ts         Comms adapter: local simulator | Retell outbound calls
-  tools.ts         tool gateway: zod schemas, risk tiers, idempotency keys, audit
-  timers.ts        durable timers, approval SLA escalation, reaper
-  faults.ts        fault injection (crash tests)
-  graphs/
-    intake.ts      supervisor agent (triage, emergency, fan-out/fan-in)
-    shiftFill.ts   long-running shift-fill agent
-    index.ts       compile graphs with Postgres checkpointer + store
-  worker.ts        mailbox-draining worker (per-thread advisory lock)
-  runtime.ts       topic -> handler; runUntilIdle for tests/demo
-  gateway.ts       Hono API: webhooks (SMS, Retell), approvals, threads, UI
-  services.ts      run gateway / workers / relay / scheduler over RabbitMQ
-  seed.ts, demo.ts
-tests/
-  scenarios.test.ts  19 end-to-end scenarios
-  rabbit.test.ts     real RabbitMQ retry -> DLQ
+  config.ts, clock.ts, log.ts, faults.ts
+  db/schema.ts       Drizzle schema (app.*): domain + control plane (runs, mailbox, timers, approvals, offers, tool_calls)
+  db/index.ts        one pg.Pool shared by Drizzle, LangGraph and graphile-worker; migrations; truncate for tests
+  mailbox.ts         deliver(): mailbox row + kick job in the caller's transaction; startThread()
+  jobs.ts            graphile add_job helpers: per-thread queues, per-caregiver memory queues
+  tasks.ts           graphile task list + crontab; runUntilIdle for tests and the demo
+  worker.ts          processThread: lease, reconcile, project, drain mailbox, invoke/resume; onThreadDead
+  timers.ts          durable timers, approval SLA (transactional page), reaper
+  tools.ts           tool gateway: zod, risk tiers, verified approvals, idempotency, exactly-once internal tools
+  llm.ts             LLM gateway: Claude structured outputs + offline heuristics
+  memory.ts          long-term memory on PostgresStore + pgvector; consolidation; memory tasks
+  comms.ts           Comms adapter: simulator | Retell
+  gateway.ts         Hono API: SMS/Retell webhooks, shifts, cancel, approvals (per-kind validation), threads, UI
+  graphs/            intake.ts (supervisor), shiftFill.ts (long-running), index.ts (versioned registry), versions.ts
+  reference/rabbitmq.ts   outbox relay + RabbitMQ topology (delay queue, DLQ): the non-Postgres alternative
+  seed.ts, demo.ts, services.ts
+drizzle/             generated migrations + 0001_invariants.sql (pgvector, btree_gist, no-overlap EXCLUDE)
+tests/scenarios.test.ts, tests/rabbit.test.ts
 ```
 
-## What each test proves
-
-| Test | Concept |
+## What the tests prove
+| Tests | Concept |
 |---|---|
-| 1 | Supervisor fan-out to child threads, fan-in barrier, checkpoint history |
-| 2 | Durable wave timers, next wave, escalation handoff, manual assign |
-| 3 | Hard filters in SQL (explainable), `Send` map-reduce scoring |
-| 4 | Risk-tiered approval gate, human **edit**, audit trail of who approved |
-| 5 | Human **reject** + reason → reflection → procedural memory → new policy applies |
-| 6 | Safety rail in code (emergency bypasses the model), idempotent side effects on resume |
-| 7 | Low-confidence triage → human picks the intent → graph continues |
-| 8 | "Review every outbound message" mode, with the human editing drafts |
-| 9 | Stale-decision guard (interrupt id), two coordinators clicking at once (409) |
-| 10 | Approval SLA → page manager exactly once |
-| 11 | **Mailbox**: an event that arrives during an approval is buffered, then consumed |
-| 12 | Duplicate webhooks + double replies → never double-book |
-| 13 | **Crash** after booking → reaper → resume from checkpoint → no double booking |
-| 14 | Stale timer from an old wave ignored |
-| 15 | Preference learned from an SMS ("no nights anymore") filters a future shift |
-| 16 | Episodic memory (vector search + filter) changes the ranking |
-| 17 | Consolidation: episodes → soft preference; decay; what the nurse said beats an inference |
-| 18 | Urgent shift → Retell **call** with memory in the prompt → `call_analyzed` webhook → booked + learned |
-| 19 | Retell mid-call function becomes a mailbox event (the voice agent can't book directly) |
-| rabbit | Real RabbitMQ: delayed retry, `RetryLater`, poison message → DLQ |
+| 1–5 | Supervisor fan-out/fan-in, wave timers → escalation → manual assign, explainable SQL filters + `Send` scoring, double texting, cancel |
+| 6–13 | Approval gate with edit; reject → reflection → procedural memory → new policy; emergency rail; low-confidence triage; draft-review mode; per-kind decision validation (400s); stale decision + double click (409); approval SLA |
+| 14–16, 22 | Mailbox buffering, duplicate webhooks, crash after booking → resume from checkpoint, stale timers |
+| 17–21 | **Review findings:** crash before bookkeeping (C1/C2), replay of `handle_event` (C3), crash inside the booking transaction (C4), DB-enforced no-overlap (C6), failed child unblocks parent (C9) |
+| 23–24 | Reaper force-unlocks a dead worker; 4 parallel workers give the same result |
+| 25–27 | Preference learned from an SMS filters future shifts; episodic memory changes ranking; consolidation + authority rules |
+| 28–30 | Retell call with memory in the prompt + transcript learning; mid-call accept + post-call webhook = one acceptance (C5); bad input → 400 |

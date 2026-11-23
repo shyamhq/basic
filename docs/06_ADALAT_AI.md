@@ -31,8 +31,10 @@ hypothesis in the interview ("I'd guess...; is that right?").
 | This repo | Adalat equivalent | Notes |
 |---|---|---|
 | ShiftFill thread (`src/graphs/shiftFill.ts`), one per open shift | **Hearing/deposition thread**, one per deposition or hearing session | Lives for hours (the hearing) to days (sign-off, corrections) |
-| Mailbox events (`thread_inbox`: `nurse_reply`, `timer`, `human_decision`) | **Audio chunk ready**, **ASR segment done**, **judge edit**, **sign-off**, **court-system callback** (e.g. case-management sync) | Same per-thread serialization + dedupe |
+| Mailbox events (`thread_inbox`: `nurse_reply`, `timer`, `human_decision`, `cancel`) | **Audio chunk ready**, **ASR segment done**, **judge edit**, **sign-off**, **court-system callback** (e.g. case-management sync) | Same per-thread serialization (named queue `thread:<id>`) + dedupe |
+| Natural thread ids (`fill:<shiftId>`) | One thread per **deposition id / case + hearing date** | A retry or a second upload can't start a duplicate thread |
 | `wait` interrupt | Waiting for the next audio segment, the judge's review, or an upload after reconnecting | No compute held while waiting |
+| `interpret` node (LLM output checkpointed before decisions) | ASR / draft output stored per chunk before anything acts on it | A replay never re-transcribes into a different result |
 | Durable timers (`timers`) | "Remind the judge to sign the deposition by end of day", "retry upload when the courtroom is back online" | Rows, not `setTimeout` |
 | HITL approval (`approval`, `review_drafts`) | **Judge or stenographer review and sign-off** before a deposition or order is final | The legal record must be human-approved; the AI drafts |
 | Approve / edit / reject | Accept the transcript, edit inline, or reject and re-dictate | Edits become training data and procedural memory |
@@ -41,9 +43,12 @@ hypothesis in the interview ("I'd guess...; is that right?").
 | Episodic memory | **Case history across hearings**: earlier depositions, adjournments, prior orders | Retrieval by case number + semantic search |
 | Semantic memory | **Statutes, legal glossary, local-language legal terms** (RAG) | Glossary also biases ASR |
 | Procedural memory (learned from rejections) | **Court-specific templates and rules** learned from judge corrections | e.g. "this court numbers paragraphs in Malayalam numerals" **(assumption)** |
-| Tool gateway risk tiers | Read case data = read; save draft = write; **finalize / publish order = high (needs signature)** | Enforced in code |
-| Outbox → RabbitMQ | Outbox → queue/stream for ASR jobs, document generation, case-management sync | Kafka fits raw audio streams; jobs fit RabbitMQ or a pg queue |
-| Reaper + checkpoints | Resume transcription after a crash or a courtroom power/network loss | Idempotent per chunk |
+| Tool gateway risk tiers (`authorize` checks a decided approval row) | Read case data = read; save draft = write; **finalize / publish order = high (needs a recorded signature)** | Enforced in code; the signer is verified, not trusted from the caller |
+| DB invariant (`no_overlapping_bookings` EXCLUDE constraint) | One final signed version per deposition; one judge per courtroom slot | Invariants live in the database, not in the agent |
+| graphile-worker (jobs enqueued in the same transaction) | Per-deposition jobs: assemble, generate PDF, case-management sync | Fine while consumers are TypeScript + Postgres |
+| RabbitMQ + outbox reference (`src/reference/rabbitmq.ts`) | When **Go services** consume the jobs (Adalat's stack has Go) | The outbox keeps it consistent with Postgres; Kafka fits raw audio streams |
+| Reaper + checkpoint-as-truth projections | Resume transcription after a crash or a courtroom power/network loss; sign-off inbox rebuilt from the checkpoint | Idempotent per chunk |
+| Per-kind decision validation (`DECISIONS`) | A "sign" action is only valid on a sign-off request, for the current version | 400 instead of a wrong action reaching the workflow |
 | `review_outbound` mode | "Nothing leaves the courtroom unsigned" mode | Default on for legal records |
 
 Cross-cutting **(assumptions)** to raise:
@@ -62,10 +67,10 @@ Cross-cutting **(assumptions)** to raise:
  Courtroom (edge device / browser)                      Cloud (India region)
  ┌──────────────────────────────┐   resumable chunk upload   ┌──────────────────────────────┐
  │ mic → VAD → 10–30s chunks    │ ─────────────────────────▶ │ Gateway: auth (court, judge),│
- │ local buffer (offline-first) │   (chunk_id = idempotency) │ dedupe, 1 tx: inbox + outbox │
+ │ local buffer (offline-first) │   (chunk_id = idempotency) │ dedupe, 1 tx: inbox + job    │
  │ optional on-device ASR draft │ ◀── live draft text ────── └──────────────┬───────────────┘
  └──────────────────────────────┘                                           │
-                                                   outbox relay → queue (asr.jobs / docs.jobs)
+                       pg job queue (or outbox relay → RabbitMQ/Kafka if Go workers consume)
                                                                            │
             ┌──────────────────────────────────────────────────────────────┴───────────┐
             ▼                                                                          ▼
@@ -95,9 +100,11 @@ deposition thread or by the judge:
 **1. How would you make transcription of a 3-hour deposition robust to crashes and network drops?**
 - Split audio into chunks with stable ids on the device.
 - Upload resumably and idempotently (the gateway dedupes on `chunk_id`).
-- Each chunk is a mailbox event for the deposition thread.
+- Each chunk is a mailbox event for the deposition thread; one job queue per thread keeps them in order.
 - ASR results are keyed by chunk, so re-processing is harmless.
 - The thread checkpoints after each segment; a reaper resumes stalled threads.
+- Treat the checkpoint as the source of truth: the sign-off inbox and status are projections
+  rebuilt on every pass, so a crash between two writes can't leave a judge without a sign-off request.
 
 **2. Real-time draft vs final transcript?**
 Two paths:
@@ -110,17 +117,19 @@ The graph only ever puts the final pass in front of the judge for signature.
 **3. Where must a human be in the loop?**
 Anything that becomes part of the legal record or an order: deposition sign-off, order
 finalization, corrections to names, numbers and sections. Make "finalize" a high-risk tool
-that requires a recorded signer, like `scheduler.book_shift` needs `approvedBy`.
+that requires a recorded signer, like `scheduler.book_shift` requires a decided approval row
+(`authorize` in `src/tools.ts` checks the database, not a caller-supplied string).
 
 **4. How do you stop a sign-off from applying to the wrong version?**
 Version every draft and hash its content. The approval stores the version and interrupt id.
 Reject a sign-off whose version isn't the current one, like the `interruptId` check in
-`src/worker.ts`, and return a conflict to the UI.
+`src/worker.ts`, and return a conflict to the UI. Validate the action per request kind at the
+gateway (`DECISIONS` in `src/gateway.ts`), so a wrong button returns 400 instead of acting.
 
 **5. How do judges' corrections improve the system?**
 - Store edit diffs per segment.
 - Recurring corrections become judge preferences (vocabulary, style) and court procedures
-  (templates). This is reflection, as in `memory.reflect`.
+  (templates). This is reflection, as in the `memory_reflect` job.
 - Corrections also feed ASR fine-tuning and evaluation data, curated and consented
   **(assumption about the process)**.
 
@@ -158,17 +167,21 @@ Reject a sign-off whose version isn't the current one, like the `interruptId` ch
 **11. Go or TypeScript for these services?**
 TypeScript for product APIs, the UI and the orchestration glue (shared types with Next.js).
 Go for high-throughput ingest (audio upload, chunk fan-out) and services needing tight
-latency and concurrency. They meet at Postgres and the queue. The queue contract is JSON,
-so workers in either language consume the same jobs.
+latency and concurrency. They meet at Postgres and the queue. In the mock the queue is a
+Postgres one (graphile-worker), which suits TypeScript workers. Once Go services consume jobs
+too, I'd switch to the pattern in `src/reference/rabbitmq.ts`: a transactional outbox table
+plus a relay to RabbitMQ (or Kafka), with a JSON contract both languages consume.
 
 **12. RabbitMQ, Kafka or a Postgres queue for audio?**
 - Raw audio chunks and partial ASR at high volume, with replay: a log (Kafka/Redpanda) or
   object storage plus events.
-- Per-deposition jobs (assemble, generate PDF, sync): a job queue (RabbitMQ or a pg-based
-  queue), with an outbox for consistency with Postgres.
+- Per-deposition jobs (assemble, generate PDF, sync): a job queue. A Postgres queue
+  (graphile-worker) gets transactional enqueue for free; RabbitMQ needs an outbox for
+  consistency with Postgres, and is the better fit when Go workers consume the jobs.
 
 **13. How do you deploy safely with Kubernetes + ArgoCD when threads are paused for days?**
-- Keep graph changes backward compatible, or version graphs and run old and new workers side by side.
+- Keep graph changes backward compatible, or version graphs and run old and new workers side by side
+  (the mock records `graph_version` per run and looks graphs up with `getGraph(name, version)`).
 - Drain old versions.
 - Migrations for checkpoint state when needed.
 - GitOps rollouts with canaries on non-critical courts first **(assumption)**.
