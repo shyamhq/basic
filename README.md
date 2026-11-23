@@ -31,6 +31,7 @@ npm run demo                  # narrated end-to-end story (incl. a crash and rec
 npm test                      # 30 scenarios + 2 RabbitMQ reference tests
 npm run services              # gateway + workers + cron; console at http://localhost:3000
 npm run db:studio             # browse the app tables (drizzle-kit studio)
+npm run record                # records a captioned video of the console driving the real system (media/vali-demo.mp4)
 ```
 No LLM key is needed. Set `ANTHROPIC_API_KEY` to use Claude, or set `COMMS_PROVIDER=retell`
 plus the `RETELL_*` vars for real phone calls (see `.env.example`).
@@ -52,6 +53,7 @@ plus the `RETELL_*` vars for real phone calls (see `.env.example`).
 | 12 | `tests/scenarios.test.ts` | 30 stories that prove it all; read them like a script |
 | 13 | [docs/05_INTERVIEW_QA.md](docs/05_INTERVIEW_QA.md) | Your Vali story, Q&A, system-design walkthrough, review findings |
 | 14 | [docs/06_ADALAT_AI.md](docs/06_ADALAT_AI.md) | Mapping all of this to Adalat AI |
+| 15 | [docs/07_MOCK_INTERVIEW.md](docs/07_MOCK_INTERVIEW.md) | A principal engineer's questions, answered: orchestration, long-running, retries, idempotency keys, memory, logs, auth |
 
 ## File map
 ```

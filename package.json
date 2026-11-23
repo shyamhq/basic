@@ -12,7 +12,8 @@
     "demo": "tsx src/demo.ts",
     "services": "tsx src/services.ts",
     "db:generate": "drizzle-kit generate",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "record": "tsx scripts/record-demo.ts"
   },
   "repository": {
     "type": "git",

@@ -225,28 +225,90 @@ app.get("/api/runs", async (c) => c.json(await db.select().from(agentRuns).order
 // ------------------------------------------------------------------ tiny console
 app.get("/", (c) => c.html(UI));
 
+// A small operations console: "be the nurse" phone simulator, approvals inbox, threads + timelines.
+// Plain HTML + fetch polling - no build step. (No backticks or ${} below: this lives inside a TS template.)
 const UI = /* html */ `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vali mock console</title>
-<style>body{font:14px system-ui;margin:16px;max-width:1100px}section{border:1px solid #ccc;border-radius:8px;padding:12px;margin:12px 0}
-pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px}button{margin-right:6px}input{margin:2px}</style></head><body>
-<h2>Vali mock console</h2>
-<section><h3>Be the nurse (SMS simulator)</h3>
-From <input id="from" value="+15550001004" size="14"> <input id="body" value="YES" size="40"> <button onclick="send()">Send SMS</button>
-<pre id="sms"></pre></section>
-<section><h3>Approvals inbox (human in the loop)</h3><div id="appr"></div></section>
-<section><h3>Agent runs</h3><pre id="runs"></pre></section>
+<title>Vali Ops Console</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--fg:#18212c;--mut:#5d6878;--line:#dde2e9;--acc:#0f6e6a;--warn:#9a5b00;--warnbg:#fdf3e1;--in:#e8f1fb;--out:#e9f5f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+header{background:#13202b;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px}
+header b{font-size:16px}header span{color:#9fb3c4;font-size:13px}
+#caption{display:none;background:#0f6e6a;color:#fff;font-size:20px;font-weight:600;padding:14px 20px}
+main{display:grid;grid-template-columns:1fr 1.25fr;gap:16px;padding:16px 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;min-width:0}
+h3{margin:0;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+input,select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px}
+button{font:inherit;padding:6px 12px;border:1px solid var(--acc);background:var(--acc);color:#fff;border-radius:6px;cursor:pointer}
+button.ghost{background:#fff;color:var(--acc)}
+.msgs{max-height:300px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+.m{padding:5px 8px;border-radius:6px;font-size:13px}.m.in{background:var(--in)}.m.out{background:var(--out)}
+.m small{color:var(--mut)}
+.appr{border:1px solid #f0d9a8;background:var(--warnbg);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+.chip{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--warn);color:var(--warn);margin-right:4px}
+.runs{display:flex;flex-direction:column;gap:3px}
+.run{display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+.run:hover,.run.sel{background:#eef3f7}
+.pill{font-size:11px;padding:1px 8px;border-radius:99px;font-family:system-ui}
+.p-done{background:#e2f1ef;color:#0f6e6a}.p-waiting_event{background:#e8f1fb;color:#24588f}.p-waiting_human{background:var(--warnbg);color:var(--warn)}.p-running,.p-queued{background:#eee;color:#555}.p-failed{background:#fbe4e1;color:#a33a2b}
+pre{margin:0;white-space:pre-wrap;font:12.5px/1.5 ui-monospace,Menlo,monospace;background:#f7f8fa;border-radius:6px;padding:8px;max-height:360px;overflow:auto}
+.empty{color:var(--mut);font-size:13px}
+</style></head><body>
+<header><b>Vali Ops Console</b><span>long-running nurse-staffing agents · LangGraph.js · Postgres · graphile-worker</span></header>
+<div id="caption"></div>
+<main>
+ <div style="display:flex;flex-direction:column;gap:16px">
+  <div class="card"><h3>Nurse phone (SMS simulator)</h3>
+   <div class="row"><select id="from">
+    <option value="+15550001001">Sofia Rossi</option><option value="+15550001002">Maria Lopez</option>
+    <option value="+15550001003">Anita Reddy</option><option value="+15550001004" selected>James Okafor</option>
+    <option value="+15550001005">Grace Lee</option></select>
+    <input id="body" placeholder="type a text..." style="flex:1;min-width:180px"><button id="send" onclick="send()">Send</button></div>
+  </div>
+  <div class="card"><h3>Messages (newest first)</h3><div id="msgs" class="msgs"></div></div>
+ </div>
+ <div style="display:flex;flex-direction:column;gap:16px">
+  <div class="card"><h3>Approvals inbox (human in the loop)</h3><div id="appr"></div></div>
+  <div class="card"><h3>Agent threads</h3><div id="runs" class="runs"></div></div>
+  <div class="card"><h3>Timeline: <span id="selname">click a thread</span></h3><pre id="timeline"></pre></div>
+ </div>
+</main>
 <script>
-async function j(u,o){const r=await fetch(u,o);return r.json()}
-async function send(){await j('/webhooks/sms',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({from:from.value,to:'+15550009999',body:body.value,messageId:'ui-'+Date.now()})});load()}
-async function decide(id,action,intent){const reason=['reject','cancel'].includes(action)?prompt('Reason?'):undefined;let edits=intent?{intent}:undefined;
- if(action==='edit'&&!intent)edits={rate:Number(prompt('New rate?'))};if(action==='assign')edits={caregiverId:prompt('Caregiver id?')};
- const r=await j('/api/approvals/'+id+'/decision',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action,edits,reason,decidedBy:'coordinator@ui'})});
- if(r.error)alert(r.error);load()}
+var sel=null, names={'+15550001001':'Sofia','+15550001002':'Maria','+15550001003':'Anita','+15550001004':'James','+15550001005':'Grace','+15550000001':'Manager'};
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+async function j(u,o){var r=await fetch(u,o);return r.json()}
+async function send(){var b=document.getElementById('body');if(!b.value)return;
+ await j('/webhooks/sms',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({from:document.getElementById('from').value,to:'+15550009999',body:b.value,messageId:'ui-'+Date.now()})});b.value='';load()}
+function val(id){var e=document.getElementById(id);return e?e.value:''}
+async function decide(id,action,intent){var body={action:action,decidedBy:'coordinator@console'};
+ if(intent)body.edits={intent:intent};
+ if(action==='edit'&&!intent)body.edits={rate:Number(val('rate-'+id))};
+ if(action==='assign')body.edits={caregiverId:val('cg-'+id)};
+ if(action==='reject'||action==='cancel')body.reason=val('reason-'+id)||'no reason given';
+ var r=await j('/api/approvals/'+id+'/decision',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ if(r.error)document.getElementById('err-'+id).textContent=r.error;load()}
+function btn(id,a,label,ghost,intent){return '<button class="'+(ghost?'ghost':'')+'" onclick="decide('+id+',\\''+a+'\\''+(intent?',\\''+intent+'\\'':'')+')">'+label+'</button>'}
+function card(x){var p=x.payload,h='<div class="appr"><div><b>#'+x.id+' '+esc(x.kind)+'</b> '+esc(p.title)+'</div>';
+ if(p.risks&&p.risks.length)h+='<div>'+p.risks.map(function(r){return '<span class="chip">'+esc(r)+'</span>'}).join('')+'</div>';
+ var row='<div class="row">';
+ if(x.kind==='approval')row+=btn(x.id,'approve','Approve')+'<input id="rate-'+x.id+'" size="4" placeholder="$/h">'+btn(x.id,'edit','Edit rate',1)+'<input id="reason-'+x.id+'" placeholder="reason">'+btn(x.id,'reject','Reject',1);
+ else if(x.kind==='escalation')row+='<input id="cg-'+x.id+'" size="10" placeholder="cg_grace">'+btn(x.id,'assign','Assign')+'<input id="reason-'+x.id+'" placeholder="reason">'+btn(x.id,'cancel','Cancel shift',1);
+ else if(x.kind==='triage_review')row+=p.options.map(function(o){return btn(x.id,'edit',o,1,o)}).join('');
+ else if(x.kind==='review_outbound')row+=btn(x.id,'approve','Approve drafts')+btn(x.id,'reject','Reject',1);
+ else row+=btn(x.id,'approve','Acknowledge');
+ return h+row+'</div><div id="err-'+x.id+'" style="color:#a33a2b;font-size:12px"></div></div>'}
+function pick(t){sel=t;load()}
 async function load(){
- const a=await j('/api/approvals?status=pending');
- appr.innerHTML=a.map(x=>'<div><b>#'+x.id+' '+x.kind+'</b> '+(x.payload.title||'')+'<br><small>'+JSON.stringify(x.payload.risks||'')+'</small><br>'+
-  (x.kind==='triage_review'?x.payload.options.map(o=>'<button onclick="decide('+x.id+',\\'edit\\',\\''+o+'\\')">'+o+'</button>').join(''):(x.payload.options||['approve','reject']).map(o=>'<button onclick="decide('+x.id+',\\''+o+'\\')">'+o+'</button>').join(''))+'</div><hr>').join('')||'empty';
- sms.textContent=(await j('/api/comms')).map(m=>m.createdAt.slice(11,19)+' '+m.direction+' '+m.channel+' '+m.phone+': '+m.body).join('\\n');
- runs.textContent=(await j('/api/runs')).map(r=>r.threadId+'  '+r.status+'  '+(r.waitingFor||'')).join('\\n');}
-load();setInterval(load,2000);
+ var a=await j('/api/approvals?status=pending');
+ var ae=document.getElementById('appr'), focused=ae.contains(document.activeElement);
+ if(!focused)ae.innerHTML=a.length?a.map(card).join(''):'<div class="empty">Nothing needs a human right now.</div>';
+ var m=await j('/api/comms');
+ document.getElementById('msgs').innerHTML=m.map(function(x){return '<div class="m '+x.direction+'"><small>'+x.createdAt.slice(11,19)+' · '+(x.direction==='in'?'from ':'to ')+(names[x.phone]||x.phone)+' · '+x.channel+'</small><br>'+esc(x.body)+'</div>'}).join('')||'<div class="empty">No messages yet.</div>';
+ var r=await j('/api/runs');
+ if(!sel&&r.length)sel=r[r.length-1].threadId;
+ document.getElementById('runs').innerHTML=r.map(function(x){return '<div class="run'+(x.threadId===sel?' sel':'')+'" onclick="pick(\\''+x.threadId+'\\')"><span>'+esc(x.threadId)+'</span><span class="pill p-'+x.status+'">'+x.status+(x.waitingFor?' · '+x.waitingFor:'')+'</span></div>'}).join('')||'<div class="empty">No agent threads yet.</div>';
+ if(sel){var t=await j('/api/threads/'+encodeURIComponent(sel));document.getElementById('selname').textContent=sel;
+  document.getElementById('timeline').textContent=(t.log||[]).join('\\n')}}
+load();setInterval(load,1500);
 </script></body></html>`;
