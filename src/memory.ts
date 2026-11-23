@@ -135,47 +135,51 @@ export async function recallForShift(agencyId: string, shift: { facility_id: str
 
 // ---------------------------------------------------------------- CONSOLIDATION (periodic, "sleep")
 // Episodic -> preference promotion + forgetting. Deterministic on purpose: easy to test and explain.
+// Promotions are NOT written here: each becomes a memory_upsert_pref job in that caregiver's queue,
+// so it can't race with an extraction for the same nurse (read-modify-write in upsertPreference).
 export async function consolidate(agencyId: string, retentionDays = 90) {
   const s = getMemoryStore();
-  const all = await s.search(ns.episodes(agencyId), { limit: 1000 });
   const cutoff = clock.now().getTime() - retentionDays * 86_400_000;
   const counts = new Map<string, number>();
-  let forgotten = 0;
-  for (const item of all) {
-    const ep = item.value as Episode;
-    if (new Date(ep.at).getTime() < cutoff) { await s.delete(ns.episodes(agencyId), item.key); forgotten++; continue; }
-    if (ep.signal === "declined" || ep.signal === "no_response") bump(counts, `${ep.caregiverId}|avoid_shift_time|${ep.shiftTime}`);
-    if (ep.signal === "assigned") bump(counts, `${ep.caregiverId}|prefer_facility|${ep.facilityId}`);
+  const forget: string[] = [];
+  let scanned = 0;
+  for (let offset = 0; ; offset += 500) {                       // page through ALL episodes
+    const page = await s.search(ns.episodes(agencyId), { limit: 500, offset });
+    if (!page.length) break;
+    for (const item of page) {
+      scanned++;
+      const ep = item.value as Episode;
+      if (new Date(ep.at).getTime() < cutoff) { forget.push(item.key); continue; }
+      if (ep.signal === "declined" || ep.signal === "no_response") bump(counts, `${ep.caregiverId}|avoid_shift_time|${ep.shiftTime}`);
+      if (ep.signal === "assigned") bump(counts, `${ep.caregiverId}|prefer_facility|${ep.facilityId}`);
+    }
   }
-  const promoted: string[] = [];
+  for (const key of forget) await s.delete(ns.episodes(agencyId), key);   // delete after paging, not during
+  const promotions: { caregiverId: string; pref: Pref }[] = [];
   for (const [k, n] of counts) {
-    if (n < 2) continue;                             // a pattern needs at least 2 observations
+    if (n < 2) continue;                                        // a pattern needs at least 2 observations
     const [caregiverId, type, value] = k.split("|");
     const text = type === "avoid_shift_time" ? `Usually turns down ${value} shifts (${n} times)` : `Often works at ${value} (${n} shifts)`;
-    const res = await upsertPreference(agencyId, caregiverId, { type: type as Pref["type"], value, strength: "soft", text }, "inferred");
-    if (res !== "kept_existing") promoted.push(`${caregiverId}: ${text}`);
+    promotions.push({ caregiverId, pref: { type: type as Pref["type"], value, strength: "soft", text } });
   }
-  return { scanned: all.length, forgotten, promoted };
+  return { scanned, forgotten: forget.length, promotions };
 }
 const bump = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
 
-// ---------------------------------------------------------------- memory.jobs handlers (background WRITE PATH)
-export async function handleMemoryJob(topic: string, p: any) {
-  switch (topic) {
-    case "memory.extract": {        // free text or a call transcript from a nurse
-      const prefs = await extractPreferences(p.text, { facilityId: p.facilityId });
-      for (const pref of prefs) await upsertPreference(p.agencyId, p.caregiverId, pref, p.source ?? "nurse_stated");
-      return;
-    }
-    case "memory.episode":          // idempotent: the key comes from the producer
-      return addEpisode(p.agencyId, p.episode, p.key);
-    case "memory.reflect": {        // a human overrode the agent -> learn a playbook rule
-      const r = await reflect({ decision: p.decision, reason: p.reason, context: p.context });
-      return addProcedure(p.agencyId, { ...r, source: `approval:${p.approvalId}` });
-    }
-    case "memory.consolidate":
-      return void (await consolidate(p.agencyId));
-    default:
-      throw new Error(`unknown memory topic ${topic}`);
-  }
-}
+// ---------------------------------------------------------------- memory jobs (background WRITE PATH)
+// Each runs as a graphile-worker task in queue "memory:<caregiverId>" -> one writer per nurse.
+export const memoryTasks = {
+  /** free text or a call transcript from a nurse -> preferences */
+  memory_extract: async (p: any) => {
+    const prefs = await extractPreferences(p.text, { facilityId: p.facilityId });
+    for (const pref of prefs) await upsertPreference(p.agencyId, p.caregiverId, pref, p.source ?? "nurse_stated");
+  },
+  /** idempotent: the key comes from the producer */
+  memory_episode: async (p: any) => addEpisode(p.agencyId, p.episode, p.key),
+  /** a human overrode the agent -> learn a playbook rule */
+  memory_reflect: async (p: any) => {
+    const r = await reflect({ decision: p.decision, reason: p.reason, context: p.context });
+    await addProcedure(p.agencyId, { ...r, source: `approval:${p.approvalId}` });
+  },
+  memory_upsert_pref: async (p: any) => void (await upsertPreference(p.agencyId, p.caregiverId, p.pref, p.source)),
+};

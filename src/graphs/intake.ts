@@ -1,24 +1,29 @@
-// INTAKE / SUPERVISOR AGENT: one thread per inbound conversation that isn't a reply to an offer.
+// INTAKE / SUPERVISOR AGENT: one thread per CONVERSATION (not per message).
 //
 //  START -> identify_caller -> classify -+-- emergency ----------> emergency (page manager, HITL ack) -> END
-//                                       +-- low confidence -----> human_triage (HITL picks the intent) -> route again
-//                                       +-- callout ------------> find_affected_shifts -> spawn_children
-//                                       |                           -> wait_children <-> collect   (FAN-OUT / FAN-IN)
-//                                       +-- preference_update --> update_preferences -> END
-//                                       +-- question/other -----> reply -> END
+//                                        +-- low confidence -----> human_triage (HITL picks the intent) -> route again
+//                                        +-- callout ------------> find_affected_shifts -> spawn_children
+//                                        |                           -> wait_children <-> collect   (FAN-OUT / FAN-IN)
+//                                        +-- preference_update --> update_preferences -> END
+//                                        +-- question/other -----> reply -> END
 //
-// SUPERVISOR PATTERN at the *system* level: instead of running ShiftFill as a subgraph inside
-// this thread, we spawn one CHILD THREAD per shift. Each child is independently durable,
-// lockable, retryable and observable; the parent just waits for "child_done" mailbox events.
-// (In-graph parallelism with Send is shown in shiftFill.ts: score_candidate.)
+// SUPERVISOR PATTERN at the system level: each affected shift gets its own CHILD THREAD
+// ("fill:<shiftId>" - a natural key, so a second text or a facility post can't start a duplicate).
+// The parent waits on child_done events (including outcome "failed"), with a deadline timer so the
+// barrier can never hang. Follow-up texts from the same nurse arrive as nurse_message events
+// ("double texting") instead of starting new conversations.
 
 import { Annotation, Command, END, interrupt, START, StateGraph } from "@langchain/langgraph";
+import { and, asc, between, eq } from "drizzle-orm";
 import { addMinutes, clock } from "../clock.js";
 import { TRIAGE_MIN_CONFIDENCE } from "../config.js";
-import { one, q, tx } from "../db.js";
+import { db } from "../db/index.js";
+import { caregivers, shifts } from "../db/schema.js";
+import { addMemoryJob } from "../jobs.js";
 import { classifyInbound, type Triage } from "../llm.js";
+import { startThread } from "../mailbox.js";
 import { getProcedures } from "../memory.js";
-import { enqueue, startThread } from "../outbox.js";
+import { setTimer } from "../timers.js";
 import { callTool } from "../tools.js";
 import { appendList, fmtTime, type MailboxEvent, type WaitPayload } from "./common.js";
 
@@ -30,22 +35,23 @@ export const IntakeState = Annotation.Root({
   channel: Annotation<string>,
   fromPhone: Annotation<string>,
   text: Annotation<string>,
-  caller: Annotation<{ kind: "caregiver" | "facility" | "unknown"; id: string | null; name: string }>,
+  caller: Annotation<{ kind: "caregiver" | "unknown"; id: string | null; name: string }>,
   triage: Annotation<Triage>,
   children: Annotation<string[]>,
   childResults: Annotation<Record<string, ChildResult>>({ reducer: (a, b) => ({ ...a, ...b }), default: () => ({}) }),
+  deadlineHit: Annotation<boolean>,
   outcome: Annotation<string | null>,
   log: appendList<string>(),
 });
 type S = typeof IntakeState.State;
 
 const sms = (s: S, body: string, key: string) =>
-  callTool("comms.send_sms", { to: s.fromPhone, body }, { threadId: s.threadId, idempotencyKey: `${s.threadId}:sms:${key}` });
+  callTool("comms.send_sms", { to: s.fromPhone, body }, { agencyId: s.agencyId, threadId: s.threadId, idempotencyKey: `${s.threadId}:sms:${key}` });
 
 async function identifyCaller(s: S): Promise<Partial<S>> {
-  const cg = await one(`SELECT id, name FROM caregivers WHERE phone = $1`, [s.fromPhone]);
+  const [cg] = await db.select({ id: caregivers.id, name: caregivers.name }).from(caregivers).where(eq(caregivers.phone, s.fromPhone));
   const caller = cg ? { kind: "caregiver" as const, id: cg.id, name: cg.name } : { kind: "unknown" as const, id: null, name: s.fromPhone };
-  return { caller, log: [`Inbound ${s.channel} from ${caller.name}: "${s.text}"`] };
+  return { caller, children: [], deadlineHit: false, outcome: null, log: [`Inbound ${s.channel} from ${caller.name}: "${s.text}"`] };
 }
 
 async function triage(s: S): Promise<Partial<S>> {
@@ -63,75 +69,90 @@ function route(s: S): string {
 }
 
 async function humanTriage(s: S): Promise<Command> {
-  const d = interrupt<WaitPayload, MailboxEvent>({
+  const ev = interrupt<WaitPayload, MailboxEvent>({
     type: "triage_review", accepts: ["human_decision"],
     title: `Unclear message from ${s.caller.name}`, text: s.text, suggestion: s.triage,
     options: ["callout", "preference_update", "question", "other"],
-  }).payload;
-  const triage = { ...s.triage, intent: d.edits?.intent ?? s.triage.intent, confidence: 1 };
-  const next = route({ ...s, triage });
-  return new Command({ goto: next, update: { triage, log: [`${d.decidedBy} set intent = ${triage.intent}`] } });
+  });
+  const d = ev.payload;
+  switch (d.action) {
+    case "edit": {
+      const triage = { ...s.triage, intent: d.edits.intent, confidence: 1 };
+      return new Command({ goto: route({ ...s, triage }), update: { triage, log: [`${d.decidedBy} set intent = ${triage.intent}`] } });
+    }
+    default:
+      throw new Error(`human_triage: unexpected action ${d.action}`);
+  }
 }
 
 async function emergency(s: S): Promise<Partial<S>> {
-  // Interrupt first; side effects after resume are idempotent anyway (tool keys).
+  // Side effects BEFORE interrupt() run again when the node resumes -> they must be idempotent (tool keys).
   await callTool("ops.page_manager", { message: `EMERGENCY from ${s.caller.name} (${s.fromPhone}): ${s.text}` },
-    { threadId: s.threadId, idempotencyKey: `${s.threadId}:page` });
+    { agencyId: s.agencyId, threadId: s.threadId, idempotencyKey: `${s.threadId}:page` });
   await sms(s, "We've alerted the on-call manager right now. If anyone is in danger, call 911.", "emergency_ack");
-  const d = interrupt<WaitPayload, MailboxEvent>({
-    type: "emergency_ack", accepts: ["human_decision"], title: `EMERGENCY: ${s.text}`, caller: s.caller,
-  }).payload;
-  return { outcome: "handled_by_human", log: [`Emergency handled by ${d.decidedBy}: ${d.reason ?? ""}`] };
+  const ev = interrupt<WaitPayload, MailboxEvent>({ type: "emergency_ack", accepts: ["human_decision"], title: `EMERGENCY: ${s.text}`, caller: s.caller, options: ["approve"] });
+  return { outcome: "handled_by_human", log: [`Emergency handled by ${ev.payload.decidedBy}: ${ev.payload.reason ?? ""}`] };
 }
 
 async function findAffectedShifts(s: S): Promise<Partial<S> | Command> {
-  const shifts = await q(
-    `SELECT id, starts_at FROM shifts WHERE caregiver_id = $1 AND status = 'scheduled' AND starts_at BETWEEN $2 AND $3 ORDER BY starts_at`,
-    [s.caller.id, clock.now(), addMinutes(clock.now(), 48 * 60)],
-  );
-  if (!shifts.length) {
+  const rows = await db.select({ id: shifts.id, startsAt: shifts.startsAt }).from(shifts)
+    .where(and(eq(shifts.caregiverId, s.caller.id!), eq(shifts.status, "scheduled"), between(shifts.startsAt, clock.now(), addMinutes(clock.now(), 48 * 60))))
+    .orderBy(asc(shifts.startsAt));
+  if (!rows.length) {
     await sms(s, "Thanks for letting us know - you have no shifts in the next 48h.", "noshifts");
     return new Command({ goto: END, update: { outcome: "no_shifts", log: ["No upcoming shifts"] } });
   }
-  return { children: shifts.map((sh) => `fill:${sh.id}:${s.threadId}`), log: [`Affected shifts: ${shifts.map((x) => `${x.id} @ ${fmtTime(x.starts_at)}`).join(", ")}`] };
+  return { children: rows.map((r) => `fill:${r.id}`), log: [`Affected shifts: ${rows.map((r) => `${r.id} @ ${fmtTime(r.startsAt)}`).join(", ")}`] };
 }
 
-async function spawnChildren(s: S): Promise<Partial<S>> {
-  // FAN-OUT through the outbox: all child threads are created in ONE transaction (all-or-nothing),
-  // and re-running this node is harmless (startThread is ON CONFLICT DO NOTHING).
-  await tx(async (c) => {
+async function spawnChildren(s: S): Promise<Partial<S> | Command> {
+  // FAN-OUT: all children created in ONE transaction. Natural ids make it idempotent AND
+  // prevent duplicates: if a shift already has a fill thread (another conversation, a facility
+  // post), we don't start a second one - and we don't wait for one we don't own.
+  const owned: string[] = [];
+  const log: string[] = [];
+  await db.transaction(async (tx) => {
     for (const childId of s.children) {
-      const shiftId = childId.split(":")[1];
-      await startThread({
-        threadId: childId, graph: "shiftfill", agencyId: s.agencyId, parentThreadId: s.threadId,
+      const shiftId = childId.slice("fill:".length);
+      const created = await startThread({
+        threadId: childId, graph: "shiftfill", agencyId: s.agencyId, subject: shiftId, parentThreadId: s.threadId,
         input: { threadId: childId, agencyId: s.agencyId, shiftId, parentThreadId: s.threadId, excludeCaregiverId: s.caller.id },
-      }, c);
+      }, tx);
+      if (created) owned.push(childId); else log.push(`${shiftId} is already being covered by ${childId}`);
     }
+    // the barrier must not hang forever: give up waiting at the earliest shift start
+    const [first] = await tx.select({ startsAt: shifts.startsAt }).from(shifts).where(eq(shifts.id, s.children[0].slice(5)));
+    await setTimer({ id: `${s.threadId}:deadline`, agencyId: s.agencyId, threadId: s.threadId, kind: "children_deadline", fireAt: first.startsAt }, tx);
   });
   await sms(s, `Feel better, ${s.caller.name.split(" ")[0]}. We're finding cover for your ${s.children.length} shift(s).`, "ack");
-  return { log: [`Spawned ${s.children.length} ShiftFill child thread(s)`] };
+  if (!owned.length) return new Command({ goto: "summarize", update: { children: [], log } });
+  return { children: owned, log: [...log, `Spawned ${owned.length} ShiftFill child thread(s)`] };
 }
 
 async function waitChildren(s: S): Promise<Partial<S>> {
   const ev = interrupt<WaitPayload, MailboxEvent>({
-    type: "wait_children", accepts: ["child_done"], pending: s.children.filter((c) => !s.childResults[c]),
+    type: "wait_children", accepts: ["child_done", "nurse_message", "timer"], pending: s.children.filter((c) => !s.childResults[c]),
   });
+  if (ev.kind === "nurse_message") {                 // double texting: acknowledge, don't start new work
+    await sms(s, "Thanks - we're already finding cover for your shifts and will text you when they're covered.", `followup:${ev.id}`);
+    return { log: [`Follow-up text acknowledged: "${ev.payload.text}"`] };
+  }
+  if (ev.kind === "timer") return { deadlineHit: true, log: ["Deadline reached while waiting for children"] };
   const r = ev.payload as ChildResult;
   return { childResults: { [r.childThreadId]: r }, log: [`Child ${r.shiftId} finished: ${r.outcome}`] };
 }
 
-function collect(s: S): string {
-  return s.children.every((c) => s.childResults[c]) ? "summarize" : "wait_children";   // barrier
-}
+const collect = (s: S) => (s.deadlineHit || s.children.every((c) => s.childResults[c]) ? "summarize" : "wait_children");   // barrier
 
 async function summarize(s: S): Promise<Partial<S>> {
   const results = Object.values(s.childResults);
   const filled = results.filter((r) => r.outcome === "filled").length;
-  return { outcome: `${filled}/${results.length} shifts covered`, log: [`All children done: ${filled}/${results.length} covered`] };
+  const failed = results.filter((r) => r.outcome === "failed").length;
+  return { outcome: `${filled}/${s.children.length} shifts covered`, log: [`All children done: ${filled}/${s.children.length} covered${failed ? `, ${failed} failed (humans paged)` : ""}`] };
 }
 
 async function updatePreferences(s: S): Promise<Partial<S>> {
-  await enqueue("memory.extract", { agencyId: s.agencyId, caregiverId: s.caller.id, text: s.text, source: "nurse_stated" }, `extract:${s.threadId}`);
+  await addMemoryJob(db, "memory_extract", { agencyId: s.agencyId, caregiverId: s.caller.id!, text: s.text, source: "nurse_stated" }, `extract:${s.threadId}`);
   await sms(s, "Got it - we've updated your preferences.", "prefs");
   return { outcome: "preferences_updated", log: ["Queued preference extraction"] };
 }
@@ -148,7 +169,7 @@ export function buildIntakeGraph() {
     .addNode("human_triage", humanTriage, { ends: ["find_affected_shifts", "update_preferences", "reply", "emergency"] })
     .addNode("emergency", emergency)
     .addNode("find_affected_shifts", findAffectedShifts, { ends: [END] })
-    .addNode("spawn_children", spawnChildren)
+    .addNode("spawn_children", spawnChildren, { ends: ["summarize"] })
     .addNode("wait_children", waitChildren)
     .addNode("summarize", summarize)
     .addNode("update_preferences", updatePreferences)

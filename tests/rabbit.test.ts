@@ -1,10 +1,22 @@
-// Integration test against a REAL RabbitMQ: delayed retry -> dead-letter queue.
+// REFERENCE implementation against a REAL RabbitMQ: outbox relay, delayed retry, dead-letter queue.
 // Skipped automatically when RabbitMQ isn't reachable (e.g. CI without docker-compose).
 
 import amqp from "amqplib";
 import { afterAll, beforeAll, expect, test } from "vitest";
-import { RabbitBus, RetryLater } from "../src/bus.js";
 import { MAX_JOB_ATTEMPTS, RABBITMQ_URL } from "../src/config.js";
+import { db, pool } from "../src/db/index.js";
+import { enqueueOutbox, InMemoryBus, RabbitBus, relayOnce, RetryLater } from "../src/reference/rabbitmq.js";
+import { setupAll } from "../src/seed.js";
+
+test("outbox: the message is written in the business transaction and relayed exactly when it commits", async () => {
+  await setupAll();
+  const bus = new InMemoryBus();
+  await db.transaction(async (tx) => { await enqueueOutbox(tx, "thread.kick", { threadId: "t1" }); });
+  await db.transaction(async (tx) => { await enqueueOutbox(tx, "thread.kick", { threadId: "t2" }); tx.rollback(); }).catch(() => {});
+  expect(await relayOnce(bus)).toBeGreaterThanOrEqual(1);
+  expect(bus.popAll().map((m) => m.payload.threadId)).toContain("t1");          // committed -> relayed
+  expect(await relayOnce(bus)).toBe(0);                                          // never twice
+});
 
 let up = false;
 try { const c = await amqp.connect(RABBITMQ_URL); await c.close(); up = true; } catch { up = false; }
@@ -18,7 +30,7 @@ beforeAll(async () => {
   for (const qn of ["agent.jobs", "agent.jobs.delay", "agent.jobs.dlq"]) await ch.purgeQueue(qn);
   await c.close();
 });
-afterAll(async () => { if (up) await bus.close(); });
+afterAll(async () => { if (up) await bus.close(); await pool.end(); });
 
 test.skipIf(!up)("poison job: retried with delay MAX_JOB_ATTEMPTS times, then parked in the DLQ; RetryLater doesn't count", async () => {
   const attempts: number[] = [];

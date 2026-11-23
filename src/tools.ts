@@ -1,121 +1,152 @@
-// TOOL GATEWAY: the only way an agent can touch the outside world.
+// TOOL GATEWAY: the only way an agent touches the outside world.
 //
-// Every tool call goes through callTool(), which does five things:
-//   1. VALIDATE  args against a strict zod schema (the LLM never sends free-form args)
-//   2. AUTHORIZE by risk tier: read | write | high. "high" needs `approvedBy`
-//                -> even if a graph has a bug, booking a shift without a human approval
-//                   (or an explicit auto-approval policy) is impossible.
-//   3. DEDUPE    with an idempotency key. LangGraph re-runs a node after a crash or an
-//                interrupt resume, so a node may call the same tool twice - the second
-//                call returns the cached result instead of texting the nurse twice.
+// callTool() does five things:
+//   1. VALIDATE   args with a strict zod schema (the model never sends free-form args)
+//   2. AUTHORIZE  by risk tier. "high" tools need an approval: either "policy:auto" or a DECIDED
+//                 approval row for this thread (verified here, not trusted from the caller).
+//   3. DEDUPE     with a deterministic idempotency key (LangGraph re-runs nodes on resume/crash).
 //   4. EXECUTE
-//   5. AUDIT     (args, result, who approved) - the same row as the idempotency cache.
+//   5. AUDIT      args, result and who approved - the same row is the idempotency cache.
 //
-// The same registry could be exposed as an MCP server so other agents (or Claude Code)
-// get the same governed tools.
+// Two kinds of tool, two guarantees:
+//   internal (our DB, e.g. book_shift): claim + business change + result in ONE transaction
+//            -> exactly-once effect. A crash anywhere rolls the whole thing back.
+//   external (SMS, phone call): we can't put Twilio/Retell in our transaction
+//            -> at-least-once. A crash after the provider accepted the message but before we
+//               recorded it can send it twice. Mitigate with provider idempotency keys if offered.
 
+import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { comms } from "./comms.js";
 import { MANAGER_PHONE } from "./config.js";
-import { one, q, tx } from "./db.js";
+import { db, type Tx } from "./db/index.js";
+import { approvals, caregivers, facilities, shifts, toolCalls } from "./db/schema.js";
+import { maybeCrash } from "./faults.js";
 
 type Risk = "read" | "write" | "high";
-type Ctx = { threadId: string; idempotencyKey: string; approvedBy?: string };
-type ToolDef<S extends z.ZodType> = { risk: Risk; schema: S; run: (args: z.infer<S>, ctx: Ctx) => Promise<unknown> };
+export type ToolCtx = {
+  agencyId: string; threadId: string; idempotencyKey: string;
+  approval?: { by: string; approvalId?: number };          // required for "high" tools
+};
+type Def<S extends z.ZodType> = {
+  risk: Risk; kind: "internal" | "external"; schema: S;
+  run: (args: z.infer<S>, ctx: ToolCtx, tx: Tx) => Promise<unknown>;
+};
+const tool = <S extends z.ZodType>(d: Def<S>) => d;
 
 export class NeedsApproval extends Error {}
-export class ToolConflict extends Error {}   // business conflict, e.g. shift already taken -> not retryable
-
-const tool = <S extends z.ZodType>(t: ToolDef<S>) => t;
+export class ToolConflict extends Error {}   // business conflict (shift taken, overlap) -> NOT retryable
 
 export const TOOLS = {
   "scheduler.get_shift": tool({
-    risk: "read",
+    risk: "read", kind: "internal",
     schema: z.object({ shiftId: z.string() }).strict(),
-    run: async ({ shiftId }) =>
-      one(`SELECT s.*, f.name AS facility_name, f.requirements, f.notes AS facility_notes
-           FROM shifts s JOIN facilities f ON f.id = s.facility_id WHERE s.id = $1`, [shiftId]),
+    run: async ({ shiftId }, _c, tx) => {
+      const [row] = await tx.select({ shift: shifts, facility: facilities }).from(shifts)
+        .innerJoin(facilities, eq(facilities.id, shifts.facilityId)).where(eq(shifts.id, shiftId));
+      return row ?? null;
+    },
   }),
 
   "scheduler.open_shift": tool({
-    risk: "write",
+    risk: "write", kind: "internal",
     schema: z.object({ shiftId: z.string(), reason: z.string() }).strict(),
-    run: async ({ shiftId }) => {
-      await q(`UPDATE shifts SET status = 'open', caregiver_id = NULL WHERE id = $1 AND status IN ('scheduled','open')`, [shiftId]);
+    run: async ({ shiftId }, _c, tx) => {
+      await tx.update(shifts).set({ status: "open", caregiverId: null })
+        .where(and(eq(shifts.id, shiftId), sql`${shifts.status} in ('scheduled','open')`));
       return { ok: true };
     },
   }),
 
   "scheduler.book_shift": tool({
-    risk: "high",
+    risk: "high", kind: "internal",
     schema: z.object({ shiftId: z.string(), caregiverId: z.string(), rate: z.number() }).strict(),
-    run: async ({ shiftId, caregiverId, rate }) =>
-      tx(async (c) => {
-        const s = await one(`SELECT * FROM shifts WHERE id = $1 FOR UPDATE`, [shiftId], c);
-        if (!s) throw new ToolConflict("shift not found");
-        if (s.status === "filled" && s.caregiver_id !== caregiverId) throw new ToolConflict("shift already filled");
-        if (s.status === "cancelled") throw new ToolConflict("shift cancelled");
-        const hours = (new Date(s.ends_at).getTime() - new Date(s.starts_at).getTime()) / 3_600_000;
-        await q(`UPDATE shifts SET status = 'filled', caregiver_id = $2, rate = $3 WHERE id = $1`, [shiftId, caregiverId, rate], c);
-        await q(`UPDATE caregivers SET hours_this_week = hours_this_week + $2 WHERE id = $1`, [caregiverId, hours], c);
-        return { ok: true, hours };
-      }),
+    run: async ({ shiftId, caregiverId, rate }, _c, tx) => {
+      const [s] = await tx.select().from(shifts).where(eq(shifts.id, shiftId)).for("update");
+      if (!s) throw new ToolConflict("shift not found");
+      if (s.status === "filled" && s.caregiverId === caregiverId) return { ok: true, alreadyBooked: true };   // idempotent
+      if (s.status === "filled") throw new ToolConflict("shift already filled");
+      if (s.status === "cancelled") throw new ToolConflict("shift cancelled");
+      const hours = (s.endsAt.getTime() - s.startsAt.getTime()) / 3_600_000;
+      try {
+        await tx.update(shifts).set({ status: "filled", caregiverId, rate }).where(eq(shifts.id, shiftId));
+      } catch (e: any) {
+        // 23P01 = exclusion_violation: the DB invariant "no overlapping bookings" said no.
+        if (e?.cause?.code === "23P01" || e?.code === "23P01") throw new ToolConflict("caregiver already booked on an overlapping shift");
+        throw e;
+      }
+      await tx.update(caregivers).set({ hoursThisWeek: sql`${caregivers.hoursThisWeek} + ${hours}` }).where(eq(caregivers.id, caregiverId));
+      return { ok: true, hours };
+    },
   }),
 
   "scheduler.cancel_shift": tool({
-    risk: "high",
+    risk: "high", kind: "internal",
     schema: z.object({ shiftId: z.string(), reason: z.string() }).strict(),
-    run: async ({ shiftId }) => {
-      await q(`UPDATE shifts SET status = 'cancelled' WHERE id = $1`, [shiftId]);
+    run: async ({ shiftId }, _c, tx) => {
+      await tx.update(shifts).set({ status: "cancelled" }).where(eq(shifts.id, shiftId));
       return { ok: true };
     },
   }),
 
   "comms.send_sms": tool({
-    risk: "write",
+    risk: "write", kind: "external",
     schema: z.object({ to: z.string(), body: z.string().max(480) }).strict(),
-    run: async ({ to, body }, ctx) => comms.sendSms(to, body, { threadId: ctx.threadId }),
+    run: async ({ to, body }, c) => comms.sendSms(to, body, { agencyId: c.agencyId, threadId: c.threadId }),
   }),
 
   "comms.start_call": tool({
-    risk: "write",
+    risk: "write", kind: "external",
     schema: z.object({ to: z.string(), vars: z.record(z.string(), z.string()) }).strict(),
-    run: async ({ to, vars }, ctx) => comms.startCall(to, vars, { threadId: ctx.threadId, offerCode: vars.offer_code }),
+    run: async ({ to, vars }, c) => comms.startCall(to, vars, { agencyId: c.agencyId, threadId: c.threadId, offerCode: vars.offer_code }),
   }),
 
   "ops.page_manager": tool({
-    risk: "write",
+    risk: "write", kind: "external",
     schema: z.object({ message: z.string() }).strict(),
-    run: async ({ message }, ctx) => comms.sendSms(MANAGER_PHONE, `[PAGE] ${message}`, { threadId: ctx.threadId }),
+    run: async ({ message }, c) => comms.sendSms(MANAGER_PHONE, `[PAGE] ${message}`, { agencyId: c.agencyId, threadId: c.threadId }),
   }),
 } as const;
 
 export type ToolName = keyof typeof TOOLS;
 
-export async function callTool<N extends ToolName>(name: N, args: z.infer<(typeof TOOLS)[N]["schema"]>, ctx: Ctx): Promise<any> {
-  const def = TOOLS[name] as ToolDef<z.ZodType>;
-  const parsed = def.schema.parse(args);                                     // 1. validate
-  if (def.risk === "high" && !ctx.approvedBy) throw new NeedsApproval(name); // 2. authorize
+export async function callTool<N extends ToolName>(name: N, args: z.infer<(typeof TOOLS)[N]["schema"]>, ctx: ToolCtx): Promise<any> {
+  const def = TOOLS[name] as Def<z.ZodType>;
+  const parsed = def.schema.parse(args);                                      // 1. validate
+  if (def.risk === "high") await authorize(name, ctx);                        // 2. authorize
 
-  // 3. dedupe: claim the key first. If someone already ran it, return their result.
-  const claimed = await one(
-    `INSERT INTO tool_calls (idempotency_key, thread_id, tool, args, approved_by) VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT (idempotency_key) DO NOTHING RETURNING idempotency_key`,
-    [ctx.idempotencyKey, ctx.threadId, name, parsed, ctx.approvedBy ?? null],
-  );
+  const claim = (tx: Tx) => tx.insert(toolCalls)                             // 3. dedupe (claim the key)
+    .values({ idempotencyKey: ctx.idempotencyKey, agencyId: ctx.agencyId, threadId: ctx.threadId, tool: name, args: parsed, approvedBy: ctx.approval?.by ?? null })
+    .onConflictDoNothing().returning({ k: toolCalls.idempotencyKey });
+  const previous = async (tx: Tx) => (await tx.select().from(toolCalls).where(eq(toolCalls.idempotencyKey, ctx.idempotencyKey)))[0];
+
+  if (def.kind === "internal") {
+    // claim + effect + result: one transaction -> exactly-once
+    return db.transaction(async (tx) => {
+      if (!(await claim(tx)).length) return (await previous(tx))!.result?.value;
+      const result = await def.run(parsed, ctx, tx);                         // 4. execute
+      maybeCrash("tool.inside_tx");                                           // tests: crash before COMMIT -> all rolled back
+      await tx.update(toolCalls).set({ result: { value: result ?? null } }).where(eq(toolCalls.idempotencyKey, ctx.idempotencyKey)); // 5. audit
+      return result;
+    });
+  }
+
+  // external: at-least-once
+  const claimed = await db.transaction(async (tx) => (await claim(tx)).length > 0);
   if (!claimed) {
-    const prev = await one(`SELECT result FROM tool_calls WHERE idempotency_key = $1`, [ctx.idempotencyKey]);
-    if (prev?.result?.error) throw new ToolConflict(prev.result.error);
-    if (prev?.result != null) return prev.result.value;
-    // fall through: claimed earlier but never finished (crash mid-call) -> run again
+    const prev = await db.transaction(previous);
+    if (prev?.result) return prev.result.value;                              // already done -> replay-safe
+    // claimed earlier but never finished (crashed mid-call) -> send again (the at-least-once window)
   }
-  try {
-    const result = await def.run(parsed, ctx);                                // 4. execute
-    await q(`UPDATE tool_calls SET result = $2 WHERE idempotency_key = $1`, [ctx.idempotencyKey, { value: result ?? null }]); // 5. audit
-    return result;
-  } catch (e) {
-    await q(`UPDATE tool_calls SET result = $2 WHERE idempotency_key = $1`, [ctx.idempotencyKey, { error: String(e) }]);
-    if (!(e instanceof ToolConflict)) await q(`DELETE FROM tool_calls WHERE idempotency_key = $1`, [ctx.idempotencyKey]); // allow retry
-    throw e;
-  }
+  const result = await def.run(parsed, ctx, null as unknown as Tx);
+  await db.update(toolCalls).set({ result: { value: result ?? null } }).where(eq(toolCalls.idempotencyKey, ctx.idempotencyKey));
+  return result;
+}
+
+/** "approvedBy" is not trusted: policy auto-approval is explicit, human approval must exist in the DB. */
+async function authorize(name: string, ctx: ToolCtx) {
+  if (!ctx.approval) throw new NeedsApproval(name);
+  if (ctx.approval.by === "policy:auto") return;
+  const [a] = await db.select().from(approvals).where(eq(approvals.id, ctx.approval.approvalId ?? -1));
+  if (!a || a.status !== "decided" || a.threadId !== ctx.threadId) throw new NeedsApproval(`${name}: no decided approval for this thread`);
 }

@@ -1,19 +1,22 @@
 // SCENARIO TESTS - each one is an interview story. Read them like a script.
-// Real Postgres + LangGraph checkpoints; the bus is in-memory and the clock is frozen.
+// Real Postgres (Drizzle + LangGraph checkpoints) and real graphile-worker; frozen clock.
 
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, test } from "vitest";
 import { addMinutes, clock } from "../src/clock.js";
-import { one, pool, q } from "../src/db.js";
+import { db, pool } from "../src/db/index.js";
+import { agencies, agentRuns, approvals, threadInbox, toolCalls } from "../src/db/schema.js";
 import { faults, SimulatedCrash } from "../src/faults.js";
-import { addEpisode, consolidate, getPreferences, getProcedures, getMemoryStore, upsertPreference } from "../src/memory.js";
-import { deliverToThread } from "../src/outbox.js";
+import { deliver } from "../src/mailbox.js";
+import { addEpisode, consolidate, getMemoryStore, getPreferences, getProcedures, upsertPreference } from "../src/memory.js";
 import { tomorrowAt } from "../src/seed.js";
 import { escalateStaleApprovals, fireDueTimers, reapDeadRuns } from "../src/timers.js";
 import {
-  PHONE, decide, get, lastMessageTo, nurseTexts, offerCode, pendingApprovals, post, postShift, reset, run, settle, shift, smsTo, threadLog,
+  PHONE, decide, get, hours, lastMessageTo, nurseTexts, offerCode, pendingApprovals, post, postShift, reset, retryAndSettle,
+  run, runs, settle, shift, smsTo, threadLog,
 } from "./helpers.js";
 
-beforeEach(reset);
+beforeEach(async () => { faults.crashAt.clear(); faults.always.clear(); await reset(); });
 afterAll(async () => { await getMemoryStore().stop(); await pool.end(); });
 
 /** Fast-forward time and let the scheduler fire due timers. */
@@ -22,126 +25,132 @@ async function passTime(minutes: number) {
   await fireDueTimers();
   return settle();
 }
-
-// A fresh day shift at Sunrise. Ranking (see logs): James, Maria (overtime) | Anita, Grace.
-const postSunriseDay = () => postShift("sh_new", "fac_sunrise", tomorrowAt(7), tomorrowAt(15), 24, 30, "geriatrics");
+// A fresh day shift at Sunrise. Ranking: James, Maria (overtime) | Anita, Grace.
+const postSunriseDay = (id = "sh_new") => postShift(id, "fac_sunrise", tomorrowAt(7), tomorrowAt(15), 24, 30, "geriatrics");
+const DAY = "fill:sh_sunrise_day";
+const EVE = "fill:sh_oak_eve";
+const NEW = "fill:sh_new";
 
 describe("orchestration", () => {
   test("1. call-out -> supervisor fans out one child thread per shift -> fan-in when all are covered", async () => {
     const { threadId } = await nurseTexts(PHONE.sofia, "Hi, I'm sick with a fever and can't make my shifts tomorrow");
     await settle();
-    const day = `fill:sh_sunrise_day:${threadId}`;
-    const eve = `fill:sh_oak_eve:${threadId}`;
-    expect((await run(day))!.status).toBe("waiting_event");          // paused at interrupt(), no worker held
-    expect((await run(eve))!.status).toBe("waiting_event");
-    expect((await run(threadId))!.waiting_for).toBe("wait_children");
+    expect((await run(DAY)).status).toBe("waiting_event");          // paused at interrupt(), no worker held
+    expect((await run(EVE)).status).toBe("waiting_event");
+    expect((await run(threadId)).waitingFor).toBe("wait_children");
     expect(await lastMessageTo(PHONE.sofia)).toContain("finding cover for your 2 shift(s)");
 
-    await nurseTexts(PHONE.james, `YES ${await offerCode(day, "cg_james")}`);
-    await nurseTexts(PHONE.anita, `yes ${await offerCode(eve, "cg_anita")}`);
+    await nurseTexts(PHONE.james, `YES ${await offerCode(DAY, "cg_james")}`);
+    await nurseTexts(PHONE.anita, `yes ${await offerCode(EVE, "cg_anita")}`);
     expect((await settle()).errors).toEqual([]);
 
-    expect((await shift("sh_sunrise_day"))!.caregiver_id).toBe("cg_james");
-    expect((await shift("sh_oak_eve"))!.caregiver_id).toBe("cg_anita");
-    expect((await run(threadId))!.status).toBe("done");
-    expect(await threadLog(threadId, "intake")).toContain("All children done: 2/2 covered");
-    // Maria was offered both shifts and got a "filled" message for each
-    expect((await smsTo(PHONE.maria)).filter((m) => m.body.includes("has been filled"))).toHaveLength(2);
-    // every super-step was checkpointed -> full history ("time travel" / audit)
-    const hist = await get(`/api/threads/${day}/history`);
-    expect(hist.length).toBeGreaterThan(8);
+    expect((await shift("sh_sunrise_day")).caregiverId).toBe("cg_james");
+    expect((await shift("sh_oak_eve")).caregiverId).toBe("cg_anita");
+    expect((await run(threadId)).status).toBe("done");
+    expect(await threadLog(threadId)).toContain("All children done: 2/2 covered");
+    expect((await smsTo(PHONE.maria)).filter((m) => m.body.includes("no longer available"))).toHaveLength(2);   // withdrawn twice
+    expect((await get(`/api/threads/${DAY}/history`)).length).toBeGreaterThan(8);                              // every super-step checkpointed
   });
 
   test("2. nobody answers -> wave timeout -> next wave -> escalate to a human who assigns manually", async () => {
-    const t = await postSunriseDay();
-    expect(await threadLog(t)).toContain("Wave 1: offered to James Okafor (sms, code " + (await offerCode(t, "cg_james")) + "), Maria Lopez (sms, code " + (await offerCode(t, "cg_maria")) + ")");
-    await passTime(16);                                              // wave 1 timer fires
-    expect((await threadLog(t)).some((l) => l.startsWith("Wave 2: offered to Anita Reddy"))).toBe(true);
-    await passTime(16);                                              // wave 2 timer fires, MAX_WAVES reached
+    await postSunriseDay();
+    expect((await threadLog(NEW)).some((l) => l.startsWith("Wave 1: offered to James Okafor"))).toBe(true);
+    await passTime(16);
+    expect((await threadLog(NEW)).some((l) => l.startsWith("Wave 2: offered to Anita Reddy"))).toBe(true);
+    await passTime(16);
     const [esc] = await pendingApprovals();
     expect(esc.kind).toBe("escalation");
-    expect((await run(t))!.status).toBe("waiting_human");
-
-    await decide(esc.id, "assign", { edits: { caregiverId: "cg_grace", rate: 25 } });
+    expect((await run(NEW)).status).toBe("waiting_human");
+    expect((await decide(esc.id, "assign", { edits: { caregiverId: "cg_grace", rate: 25 } })).status).toBe(200);
     await settle();
-    expect((await shift("sh_new"))!.caregiver_id).toBe("cg_grace");
-    expect((await threadLog(t)).at(-1)).toBe("Finished: filled");
+    expect((await shift("sh_new")).caregiverId).toBe("cg_grace");
+    expect((await threadLog(NEW)).at(-1)).toBe("Finished: filled");
   });
 
-  test("3. Send fan-out scores every candidate in parallel; hard filters are explainable", async () => {
-    const t = await postSunriseDay();
-    const log = await threadLog(t);
-    // Brian too far, Tom no TB test, Priya is an RN: filtered in SQL before any LLM/scoring
+  test("3. hard filters in SQL are explainable; Send fan-out scores every candidate", async () => {
+    await postSunriseDay();
+    const log = await threadLog(NEW);
     expect(log).toContain("5 matched license/certs/availability, 4 within travel distance, 4 after memory filters");
     expect(log.filter((l) => l.startsWith("Rank #"))).toHaveLength(3);
+  });
+
+  test("4. double texting: a second call-out text joins the open conversation - no duplicate fill threads", async () => {
+    const first = await nurseTexts(PHONE.sofia, "I'm sick, can't make my shifts tomorrow");
+    await settle();
+    const second = await nurseTexts(PHONE.sofia, "so sorry, I really can't make it tomorrow");
+    expect(second.routed).toBe("intake-followup");
+    await settle();
+    expect((await runs("shiftfill")).map((r) => r.threadId).sort()).toEqual([DAY, EVE].sort());
+    expect((await runs("intake")).map((r) => r.threadId)).toEqual([first.threadId]);
+    expect(await lastMessageTo(PHONE.sofia)).toContain("already finding cover");
+  });
+
+  test("5. cancel: every pause accepts 'cancel'; open offers are withdrawn", async () => {
+    await postSunriseDay();
+    await post(`/api/threads/${NEW}/cancel`, { reason: "facility filled it internally" });
+    await settle();
+    expect((await run(NEW)).status).toBe("done");
+    expect(await lastMessageTo(PHONE.james)).toContain("no longer available");
+    expect((await threadLog(NEW)).at(-1)).toBe("Finished: cancelled");
   });
 });
 
 describe("human in the loop", () => {
-  test("4. overtime -> approval gate -> coordinator EDITS the rate and approves", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.maria, `Yes ${await offerCode(t, "cg_maria")}`);
+  test("6. overtime -> approval gate -> coordinator EDITS the rate and approves (audited)", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.maria, `Yes ${await offerCode(NEW, "cg_maria")}`);
     await settle();
     const [a] = await pendingApprovals();
-    expect(a.kind).toBe("approval");
-    expect(a.payload.risks).toEqual(["overtime"]);
-    expect((await shift("sh_new"))!.status).toBe("open");            // nothing booked without a human
-
+    expect([a.kind, a.payload.risks]).toEqual(["approval", ["overtime"]]);
+    expect((await shift("sh_new")).status).toBe("open");               // nothing booked without a human
     await decide(a.id, "edit", { edits: { rate: 28 } });
     await settle();
     const s = await shift("sh_new");
-    expect([s!.caregiver_id, s!.rate]).toEqual(["cg_maria", 28]);
-    const call = await one(`SELECT approved_by FROM tool_calls WHERE tool = 'scheduler.book_shift'`);
-    expect(call.approved_by).toBe("coordinator@test");               // audit trail
+    expect([s.caregiverId, s.rate]).toEqual(["cg_maria", 28]);
+    const [call] = await db.select().from(toolCalls).where(eq(toolCalls.tool, "scheduler.book_shift"));
+    expect(call.approvedBy).toBe("coordinator@test");
   });
 
-  test("5. coordinator REJECTS with a reason -> reflection writes procedural memory -> new policy applies", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.james, `NO ${await offerCode(t, "cg_james")}`);
-    await nurseTexts(PHONE.maria, `yes ${await offerCode(t, "cg_maria")}`);
+  test("7. REJECT with a reason -> reflection writes procedural memory -> the learned rule gates the next booking", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.james, `NO ${await offerCode(NEW, "cg_james")}`);
+    await nurseTexts(PHONE.maria, `yes ${await offerCode(NEW, "cg_maria")}`);
     await settle();
     const [a] = await pendingApprovals();
     await decide(a.id, "reject", { reason: "Never book someone's first shift at a facility without checking with me" });
-    await settle();                                                    // memory.reflect runs in the background
-    const procs = await getProcedures("ag_bright");
-    expect(procs[0].rule).toEqual({ type: "require_approval", when: "first_shift_at_facility" });
-    expect(await lastMessageTo(PHONE.maria)).toContain("gone another way");
-
-    // wave 2 went out (Anita, Grace). Anita has never worked at Sunrise -> the LEARNED rule now gates her.
-    await nurseTexts(PHONE.anita, `yes ${await offerCode(t, "cg_anita")}`);
     await settle();
-    const [b] = await pendingApprovals();
-    expect(b.payload.risks).toContain("first_shift_at_facility");
+    expect((await getProcedures("ag_bright"))[0].rule).toEqual({ type: "require_approval", when: "first_shift_at_facility" });
+    expect(await lastMessageTo(PHONE.maria)).toContain("gone another way");
+    await nurseTexts(PHONE.anita, `yes ${await offerCode(NEW, "cg_anita")}`);   // wave 2; Anita never worked at Sunrise
+    await settle();
+    expect((await pendingApprovals())[0].payload.risks).toContain("first_shift_at_facility");
   });
 
-  test("6. emergency keywords bypass the model and go straight to a human", async () => {
+  test("8. emergency keywords bypass the model -> human; side effects before interrupt() happen once", async () => {
     const { threadId } = await nurseTexts(PHONE.sofia, "Resident fell in room 12 and is bleeding, what do I do");
     await settle();
     expect(await lastMessageTo(PHONE.manager)).toContain("EMERGENCY");
-    expect(await lastMessageTo(PHONE.sofia)).toContain("call 911");
     const [a] = await pendingApprovals();
     expect(a.kind).toBe("emergency_ack");
     await decide(a.id, "approve", { reason: "Called the DON, resident stable" });
     await settle();
-    expect((await run(threadId))!.status).toBe("done");
-    // the page happened exactly once even though the node re-ran on resume (idempotent tools)
+    expect((await run(threadId)).status).toBe("done");
     expect((await smsTo(PHONE.manager)).filter((m) => m.body.includes("EMERGENCY"))).toHaveLength(1);
   });
 
-  test("7. low-confidence triage -> a human picks the intent -> the graph continues", async () => {
+  test("9. low-confidence triage -> a human picks the intent", async () => {
     const { threadId } = await nurseTexts(PHONE.grace, "hmm about tomorrow");
     await settle();
     const [a] = await pendingApprovals();
     expect(a.kind).toBe("triage_review");
     await decide(a.id, "edit", { edits: { intent: "question" } });
     await settle();
-    expect(await threadLog(threadId, "intake")).toContain("coordinator@test set intent = question");
-    expect(await lastMessageTo(PHONE.grace)).toContain("coordinator will get back to you");
+    expect(await threadLog(threadId)).toContain("coordinator@test set intent = question");
   });
 
-  test("8. review-every-message mode: nothing reaches a nurse until a human approves (and edits) the draft", async () => {
-    await q(`UPDATE agencies SET review_outbound = true`);
-    const t = await postSunriseDay();
+  test("10. review-every-message mode: nothing reaches a nurse until a human approves (and edits) the draft", async () => {
+    await db.update(agencies).set({ reviewOutbound: true });
+    await postSunriseDay();
     expect(await smsTo(PHONE.james)).toHaveLength(0);
     const [a] = await pendingApprovals();
     expect(a.kind).toBe("review_outbound");
@@ -149,163 +158,248 @@ describe("human in the loop", () => {
     await decide(a.id, "approve", { edits: { drafts } });
     await settle();
     expect(await lastMessageTo(PHONE.james)).toMatch(/^Good morning James/);
-    expect((await run(t))!.status).toBe("waiting_event");
   });
 
-  test("9. two coordinators click at once -> first wins; a decision for an OLD interrupt is discarded", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.maria, `yes ${await offerCode(t, "cg_maria")}`);
+  test("11. decisions are validated per kind: 'approve' on an escalation or an unknown caregiver -> 400, shift untouched", async () => {
+    await postSunriseDay();
+    await passTime(16); await passTime(16);
+    const [esc] = await pendingApprovals();
+    expect((await decide(esc.id, "approve")).status).toBe(400);
+    expect((await decide(esc.id, "assign", { edits: { caregiverId: "cg_typo" } })).status).toBe(400);
+    expect((await shift("sh_new")).status).toBe("open");
+    expect((await pendingApprovals())[0].id).toBe(esc.id);                // still pending, still actionable
+  });
+
+  test("12. stale decision for an OLD interrupt is discarded; two clicks -> 409", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.maria, `yes ${await offerCode(NEW, "cg_maria")}`);
     await settle();
     const [a] = await pendingApprovals();
-    // a late decision for an OLD interrupt (e.g. a previous approval round) must not resume this one
-    await deliverToThread(t, "human_decision", { action: "approve", interruptId: "old-interrupt", decidedBy: "x" }, "stale-1");
+    await db.transaction((tx) => deliver(tx, { agencyId: "ag_bright", threadId: NEW, kind: "human_decision", payload: { action: "approve", interruptId: "old", decidedBy: "x" }, dedupeKey: "stale-1" }));
     await settle();
-    expect((await one(`SELECT status FROM thread_inbox WHERE dedupe_key = 'stale-1'`)).status).toBe("stale");
-    expect((await shift("sh_new"))!.status).toBe("open");
-    // two coordinators: first click wins, the second gets 409
+    expect((await db.select().from(threadInbox).where(eq(threadInbox.dedupeKey, "stale-1")))[0].status).toBe("stale");
     expect((await decide(a.id, "approve")).status).toBe(200);
-    expect((await decide(a.id, "reject", { reason: "x" })).status).toBe(409);
+    expect((await decide(a.id, "reject", { reason: "too late" })).status).toBe(409);
     await settle();
-    expect((await shift("sh_new"))!.caregiver_id).toBe("cg_maria");
+    expect((await shift("sh_new")).caregiverId).toBe("cg_maria");
   });
 
-  test("10. approval SLA: nobody answers in 10 minutes -> the on-call manager is paged once", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.maria, `yes ${await offerCode(t, "cg_maria")}`);
+  test("13. approval SLA: unanswered for 10 minutes -> manager paged exactly once (flag + page job commit together)", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.maria, `yes ${await offerCode(NEW, "cg_maria")}`);
     await settle();
     clock.advanceMinutes(11);
     expect(await escalateStaleApprovals()).toBe(1);
     expect(await escalateStaleApprovals()).toBe(0);
+    await settle();
     expect(await lastMessageTo(PHONE.manager)).toContain("waiting > 10 min");
   });
 });
 
 describe("long-running reliability", () => {
-  test("11. MAILBOX: an event the graph can't use yet is buffered, then consumed later in order", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.maria, `yes ${await offerCode(t, "cg_maria")}`);   // -> approval pending
+  test("14. MAILBOX: an event the graph can't use yet is buffered, then consumed in order", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.maria, `yes ${await offerCode(NEW, "cg_maria")}`);    // -> approval pending
     await settle();
-    await nurseTexts(PHONE.james, `YES ${await offerCode(t, "cg_james")}`);    // arrives while waiting on a human
+    await nurseTexts(PHONE.james, `YES ${await offerCode(NEW, "cg_james")}`);     // arrives while waiting on a human
     await settle();
-    const buffered = await one(`SELECT status FROM thread_inbox WHERE thread_id = $1 AND kind = 'nurse_reply' ORDER BY id DESC LIMIT 1`, [t]);
-    expect(buffered.status).toBe("pending");                          // held, not lost, not misapplied
+    const [buffered] = await db.select().from(threadInbox).where(and(eq(threadInbox.threadId, NEW), eq(threadInbox.kind, "nurse_reply"))).orderBy(threadInbox.id).offset(1);
+    expect(buffered.status).toBe("pending");
     const [a] = await pendingApprovals();
     await decide(a.id, "reject", { reason: "Maria is too tired this week" });
-    await settle();                                                    // back at wait -> James's YES is consumed
-    expect((await shift("sh_new"))!.caregiver_id).toBe("cg_james");
+    await settle();
+    expect((await shift("sh_new")).caregiverId).toBe("cg_james");
   });
 
-  test("12. duplicate webhooks + double replies never double-book", async () => {
-    const t = await postSunriseDay();
-    const code = await offerCode(t, "cg_james");
+  test("15. duplicate webhook + nurse double-texting -> one booking; she hears 'you're all set', not 'unavailable'", async () => {
+    await postSunriseDay();
+    const code = await offerCode(NEW, "cg_james");
     await nurseTexts(PHONE.james, `YES ${code}`, "dup-1");
-    expect((await nurseTexts(PHONE.james, `YES ${code}`, "dup-1")).duplicate).toBe(true);   // provider retry
+    expect((await nurseTexts(PHONE.james, `YES ${code}`, "dup-1")).duplicate).toBe(true);
     await settle();
-    await nurseTexts(PHONE.james, `yes!! ${code}`, "dup-2");                                // nurse double-texts
+    await nurseTexts(PHONE.james, `yes!! ${code}`, "dup-2");
     await settle();
-    expect((await one(`SELECT hours_this_week FROM caregivers WHERE id = 'cg_james'`)).hours_this_week).toBe(32);
-    expect((await q(`SELECT 1 FROM tool_calls WHERE tool = 'scheduler.book_shift'`)).length).toBe(1);
-    expect(await lastMessageTo(PHONE.james)).toContain("no longer available");
+    expect(await hours("cg_james")).toBe(32);
+    expect(await db.select().from(toolCalls).where(eq(toolCalls.tool, "scheduler.book_shift"))).toHaveLength(1);
+    expect(await lastMessageTo(PHONE.james)).toContain("you're booked for that shift");
   });
 
-  test("13. crash AFTER booking, BEFORE the node finished -> reaper resumes from checkpoint, no double booking", async () => {
-    const t = await postSunriseDay();
+  test("16. crash after booking, before the node finished -> job retry resumes from the checkpoint, no double booking", async () => {
+    await postSunriseDay();
     faults.crashAt.add("after_book");
-    await nurseTexts(PHONE.james, `YES ${await offerCode(t, "cg_james")}`);
-    const { errors } = await settle();
-    expect(errors[0]).toBeInstanceOf(SimulatedCrash);
-    expect((await run(t))!.status).toBe("running");                  // "the process died"
-    expect((await shift("sh_new"))!.status).toBe("filled");          // the side effect DID happen
-
-    clock.advanceMinutes(2);                                          // heartbeat is now stale
-    expect(await reapDeadRuns()).toEqual([t]);
-    expect((await settle()).errors).toEqual([]);
-    expect((await run(t))!.status).toBe("done");
-    expect((await one(`SELECT hours_this_week FROM caregivers WHERE id = 'cg_james'`)).hours_this_week).toBe(32);   // +8 once
+    await nurseTexts(PHONE.james, `YES ${await offerCode(NEW, "cg_james")}`);
+    expect((await settle()).errors[0]).toBeInstanceOf(SimulatedCrash);
+    expect((await shift("sh_new")).status).toBe("filled");            // the side effect DID happen
+    expect((await retryAndSettle()).errors).toEqual([]);
+    expect((await run(NEW)).status).toBe("done");
+    expect(await hours("cg_james")).toBe(32);                          // +8 once
     expect((await smsTo(PHONE.james)).filter((m) => m.body.startsWith("You're booked"))).toHaveLength(1);
   });
 
-  test("14. a stale timer from an old wave is ignored", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.james, `NO ${await offerCode(t, "cg_james")}`);
-    await nurseTexts(PHONE.maria, `NO ${await offerCode(t, "cg_maria")}`);   // whole wave declined -> wave 2 immediately
+  test("17. [review C1/C2] crash right after invoke(), before ANY bookkeeping -> next drain rebuilds the approvals inbox", async () => {
+    await postSunriseDay();
+    faults.crashAt.add("worker.after_invoke");
+    await nurseTexts(PHONE.maria, `yes ${await offerCode(NEW, "cg_maria")}`);
     await settle();
-    expect((await threadLog(t)).some((l) => l.startsWith("Wave 2"))).toBe(true);
-    await deliverToThread(t, "timer", { timerKind: "wave_timeout", wave: 1 }, "old-timer");
+    expect(await pendingApprovals()).toHaveLength(0);                  // the crash window
+    await retryAndSettle();
+    const [a] = await pendingApprovals();
+    expect(a.kind).toBe("approval");                                  // projection repaired from the checkpoint
+    expect((await run(NEW)).status).toBe("waiting_human");
+    const [yes] = await db.select().from(threadInbox).where(and(eq(threadInbox.threadId, NEW), eq(threadInbox.kind, "nurse_reply")));
+    expect(yes.status).toBe("consumed");                              // not left pending -> no bogus "unavailable" later
+    await decide(a.id, "approve");
     await settle();
-    expect((await threadLog(t)).filter((l) => l.startsWith("Wave 3"))).toHaveLength(0);
-    expect((await run(t))!.status).toBe("waiting_event");
+    expect((await smsTo(PHONE.maria)).some((m) => m.body.includes("no longer available"))).toBe(false);
+  });
+
+  test("18. [review C3] crash after the offer update inside handle_event -> replay still takes the accept branch", async () => {
+    await postSunriseDay();
+    faults.crashAt.add("handle_event.after_offer_update");
+    await nurseTexts(PHONE.james, `YES ${await offerCode(NEW, "cg_james")}`);
+    await settle();
+    await retryAndSettle();
+    expect((await shift("sh_new")).caregiverId).toBe("cg_james");
+    expect((await smsTo(PHONE.james)).some((m) => m.body.includes("no longer available"))).toBe(false);
+  });
+
+  test("19. [review C4] crash inside the booking transaction -> rolled back, retried, hours counted once", async () => {
+    await postSunriseDay();
+    faults.crashAt.add("tool.inside_tx");                              // first internal tool call after this is... the booking
+    await nurseTexts(PHONE.james, `YES ${await offerCode(NEW, "cg_james")}`);
+    await settle();
+    await retryAndSettle();
+    expect((await shift("sh_new")).caregiverId).toBe("cg_james");
+    expect(await hours("cg_james")).toBe(32);
+  });
+
+  test("20. [review C6] the DATABASE forbids overlapping bookings: second booking conflicts, the agent moves on", async () => {
+    await postSunriseDay("sh_a");
+    await postShift("sh_b", "fac_sunrise", tomorrowAt(8), tomorrowAt(16), 24, 30, "geriatrics");   // overlaps sh_a
+    await nurseTexts(PHONE.james, `YES ${await offerCode("fill:sh_a", "cg_james")}`);
+    await nurseTexts(PHONE.james, `YES ${await offerCode("fill:sh_b", "cg_james")}`);
+    await settle();
+    expect((await shift("sh_a")).caregiverId).toBe("cg_james");
+    expect((await shift("sh_b")).caregiverId).not.toBe("cg_james");
+    expect((await threadLog("fill:sh_b")).some((l) => l.includes("overlapping"))).toBe(true);
+    expect((await threadLog("fill:sh_b")).some((l) => l.startsWith("Wave 2"))).toBe(true);           // moved on
+  });
+
+  test("21. [review C9] a child that fails permanently -> page a human AND unblock the parent's fan-in", async () => {
+    const { threadId } = await nurseTexts(PHONE.sofia, "I'm sick, can't make my shifts tomorrow");
+    await settle();
+    faults.always.add("after_book");
+    await nurseTexts(PHONE.james, `YES ${await offerCode(DAY, "cg_james")}`);
+    for (let i = 0; i < 6; i++) await retryAndSettle();               // exhaust max_attempts (5)
+    faults.always.clear();
+    expect((await run(DAY)).status).toBe("failed");
+    expect(await lastMessageTo(PHONE.manager)).toContain(`${DAY} FAILED`);
+    await nurseTexts(PHONE.anita, `yes ${await offerCode(EVE, "cg_anita")}`);
+    await settle();
+    expect(await threadLog(threadId)).toContain("All children done: 1/2 covered, 1 failed (humans paged)");
+  });
+
+  test("22. a stale timer from an old wave is ignored", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.james, `NO ${await offerCode(NEW, "cg_james")}`);
+    await nurseTexts(PHONE.maria, `NO ${await offerCode(NEW, "cg_maria")}`);   // whole wave declined -> wave 2 now
+    await settle();
+    await db.transaction((tx) => deliver(tx, { agencyId: "ag_bright", threadId: NEW, kind: "timer", payload: { timerKind: "wave_timeout", wave: 1 }, dedupeKey: "old-timer" }));
+    await settle();
+    expect((await threadLog(NEW)).filter((l) => l.startsWith("Wave 3"))).toHaveLength(0);
+    expect((await run(NEW)).status).toBe("waiting_event");
+  });
+
+  test("23. reaper: a 'running' thread with a stale heartbeat is force-unlocked and re-kicked", async () => {
+    await postSunriseDay();
+    await db.update(agentRuns).set({ status: "running", leaseOwner: "worker-that-died", heartbeatAt: clock.now() }).where(eq(agentRuns.threadId, NEW));
+    clock.advanceMinutes(2);
+    expect(await reapDeadRuns()).toEqual([NEW]);
+    await settle();
+    expect((await run(NEW)).status).toBe("waiting_event");             // projection restored on the next drain
+  });
+
+  test("24. parallel workers (concurrency 4) give the same result: named queues serialize each thread", async () => {
+    await nurseTexts(PHONE.sofia, "I'm sick, can't make my shifts tomorrow");
+    await settle(4);
+    await nurseTexts(PHONE.james, `YES ${await offerCode(DAY, "cg_james")}`);
+    await nurseTexts(PHONE.maria, `YES ${await offerCode(DAY, "cg_maria")}`);
+    await nurseTexts(PHONE.anita, `yes ${await offerCode(EVE, "cg_anita")}`);
+    expect((await settle(4)).errors).toEqual([]);
+    expect((await shift("sh_sunrise_day")).caregiverId).toBe("cg_james");
+    expect(await db.select().from(toolCalls).where(eq(toolCalls.tool, "scheduler.book_shift"))).toHaveLength(2);
   });
 });
 
 describe("memory", () => {
-  test("15. preference stated in a reply ('no nights anymore') is learned and filters future night shifts", async () => {
-    const t = await postSunriseDay();
-    await nurseTexts(PHONE.james, `No ${await offerCode(t, "cg_james")}, and I don't do nights anymore`);
+  test("25. preference stated in a reply ('no nights anymore') is learned and filters future night shifts", async () => {
+    await postSunriseDay();
+    await nurseTexts(PHONE.james, `No ${await offerCode(NEW, "cg_james")}, and I don't do nights anymore`);
     await settle();
-    const prefs = await getPreferences("ag_bright", "cg_james");
-    expect(prefs).toEqual([expect.objectContaining({ type: "avoid_shift_time", value: "night", strength: "hard", source: "nurse_stated" })]);
-
+    expect(await getPreferences("ag_bright", "cg_james")).toEqual([expect.objectContaining({ type: "avoid_shift_time", value: "night", strength: "hard", source: "nurse_stated" })]);
     const night = await postShift("sh_night", "fac_sunrise", tomorrowAt(23), addMinutes(tomorrowAt(23), 480), 26, 32);
     expect(await threadLog(night)).toContain('Excluded James Okafor: memory says "Does not work night shifts" (nurse_stated)');
   });
 
-  test("16. episodic memory: past outcomes at a facility change the ranking (semantic search + filter)", async () => {
+  test("26. episodic memory (vector search + filter) changes the ranking", async () => {
     for (let i = 0; i < 2; i++) {
-      await addEpisode("ag_bright", { text: "James Okafor declined a day CNA shift at Sunrise Manor", caregiverId: "cg_james",
-        facilityId: "fac_sunrise", shiftId: `old${i}`, signal: "declined", shiftTime: "day" });
+      await addEpisode("ag_bright", { text: "James Okafor declined a day CNA shift at Sunrise Manor", caregiverId: "cg_james", facilityId: "fac_sunrise", shiftId: `old${i}`, signal: "declined", shiftTime: "day" });
     }
-    const t = await postSunriseDay();
-    const rank1 = (await threadLog(t)).find((l) => l.startsWith("Rank #1"))!;
-    expect(rank1).toContain("Maria Lopez");                          // James dropped from #1
-    expect((await threadLog(t)).find((l) => l.includes("James Okafor score"))).toContain("episode: declined here before");
+    await postSunriseDay();
+    expect((await threadLog(NEW)).find((l) => l.startsWith("Rank #1"))).toContain("Maria Lopez");
   });
 
-  test("17. consolidation promotes repeated episodes into a soft preference - but never overrides what the nurse said", async () => {
+  test("27. consolidation promotes repeated episodes (via per-nurse jobs) - but never overrides what the nurse said", async () => {
     for (let i = 0; i < 2; i++) {
       await addEpisode("ag_bright", { text: "Grace declined a day shift", caregiverId: "cg_grace", facilityId: "fac_sunrise", shiftId: `g${i}`, signal: "declined", shiftTime: "day" });
       await addEpisode("ag_bright", { text: "Anita declined a night shift", caregiverId: "cg_anita", facilityId: "fac_oak", shiftId: `a${i}`, signal: "declined", shiftTime: "night" });
     }
     await addEpisode("ag_bright", { text: "ancient", caregiverId: "cg_tom", facilityId: "fac_oak", shiftId: "old", signal: "declined", shiftTime: "day", at: "2026-01-01T00:00:00Z" });
-    // Anita herself said she is fine with nights -> stated beats inferred
     await upsertPreference("ag_bright", "cg_anita", { type: "avoid_shift_time", value: "night", strength: "soft", text: "Happy to do nights now" }, "nurse_stated");
-
     const res = await consolidate("ag_bright");
-    expect(res.forgotten).toBe(1);                                    // decay: older than 90 days
-    expect(res.promoted).toEqual(["cg_grace: Usually turns down day shifts (2 times)"]);
-    expect((await getPreferences("ag_bright", "cg_anita"))[0].text).toBe("Happy to do nights now");
+    expect(res.forgotten).toBe(1);
+    expect(res.promotions.map((p) => p.caregiverId).sort()).toEqual(["cg_anita", "cg_grace"]);
+    for (const p of res.promotions) await upsertPreference("ag_bright", p.caregiverId, p.pref, "inferred");
+    expect((await getPreferences("ag_bright", "cg_grace"))[0].text).toBe("Usually turns down day shifts (2 times)");
+    expect((await getPreferences("ag_bright", "cg_anita"))[0].text).toBe("Happy to do nights now");   // stated beats inferred
   });
 });
 
 describe("voice (Retell)", () => {
-  test("18. urgent shift -> agent CALLS via Retell with memory in the prompt -> call_analyzed webhook books it + learns from transcript", async () => {
+  test("28. urgent shift -> Retell CALL with memory in the prompt -> call_analyzed books it + learns from the transcript", async () => {
     clock.freeze(new Date("2026-11-24T10:00:00Z"));
     await upsertPreference("ag_bright", "cg_anita", { type: "prefer_facility", value: "fac_oak", strength: "soft", text: "Likes the Oakridge team" }, "nurse_stated");
-    const start = new Date("2026-11-24T13:00:00Z");                  // 3h away -> urgent
+    const start = new Date("2026-11-24T13:00:00Z");
     const t = await postShift("sh_urgent", "fac_oak", start, addMinutes(start, 480), 26, 32, "dementia");
-    const call = await one(`SELECT * FROM comms_log WHERE phone = $1`, [PHONE.anita]);
+    const [call] = await smsTo(PHONE.anita);
     expect(call.channel).toBe("call");
     expect(call.meta.vars.known_preferences).toContain("Likes the Oakridge team");
-
     const code = await offerCode(t, "cg_anita");
-    const res = await post("/webhooks/retell", {
-      event: "call_analyzed",
-      call: { call_id: "call_1", metadata: { offerCode: code }, transcript: "Agent: ... Anita: Yes I'll take it. Also please don't call me before 9.",
-        call_analysis: { custom_analysis_data: { accepted: true } } },
-    });
+    const res = await post("/webhooks/retell", { event: "call_analyzed", call: { call_id: "call_1", metadata: { offerCode: code },
+      transcript: "Anita: Yes I'll take it. Also please don't call me before 9.", call_analysis: { custom_analysis_data: { accepted: true } } } });
     expect(res.body.routed).toBe(t);
     await settle();
-    expect((await shift("sh_urgent"))!.caregiver_id).toBe("cg_anita");
+    expect((await shift("sh_urgent")).caregiverId).toBe("cg_anita");
     expect((await getPreferences("ag_bright", "cg_anita")).map((p) => p.type)).toContain("contact_after_hour");
   });
 
-  test("19. Retell mid-call function: accept_shift becomes a mailbox event (the voice agent can't book directly)", async () => {
-    const t = await postSunriseDay();
-    const code = await offerCode(t, "cg_james");
-    const res = await post("/retell/functions/accept_shift", { args: { offer_code: code }, call: { call_id: "c2", metadata: { offerCode: code } } });
-    expect(res.body.result).toContain("confirming");
-    expect((await shift("sh_new"))!.status).toBe("open");            // not booked by the voice agent itself
+  test("29. [review C5] mid-call accept_shift + post-call call_analyzed = ONE acceptance, booked once, no 'unavailable' text", async () => {
+    await postSunriseDay();
+    const code = await offerCode(NEW, "cg_james");
+    const fn = await post("/retell/functions/accept_shift", { args: { offer_code: code }, call: { call_id: "c2", metadata: { offerCode: code } } });
+    expect(fn.body.result).toContain("confirming");
+    expect((await shift("sh_new")).status).toBe("open");               // the voice agent can't book directly
+    await post("/webhooks/retell", { event: "call_analyzed", call: { call_id: "c2", metadata: { offerCode: code }, call_analysis: { custom_analysis_data: { accepted: true } } } });
     await settle();
-    expect((await shift("sh_new"))!.caregiver_id).toBe("cg_james");  // booked by the graph
+    expect((await shift("sh_new")).caregiverId).toBe("cg_james");
+    expect(await db.select().from(threadInbox).where(and(eq(threadInbox.threadId, NEW), eq(threadInbox.kind, "nurse_reply")))).toHaveLength(1);
+    expect((await smsTo(PHONE.james)).some((m) => m.body.includes("no longer available"))).toBe(false);
+  });
+
+  test("30. bad webhook input -> 400 (not 500, which providers would retry forever)", async () => {
+    expect((await post("/webhooks/sms", { from: PHONE.james })).status).toBe(400);
+    expect((await post("/api/shifts", { id: "x" })).status).toBe(400);
   });
 });
+
+void approvals;

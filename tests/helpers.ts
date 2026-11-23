@@ -1,15 +1,15 @@
-// Test harness: real Postgres, in-memory bus, frozen clock, gateway called in-process.
+// Test harness: real Postgres, real graphile-worker (runOnce), frozen clock, gateway called in-process.
 
-import { InMemoryBus } from "../src/bus.js";
+import { and, asc, eq } from "drizzle-orm";
 import { clock } from "../src/clock.js";
-import { one, q } from "../src/db.js";
+import { db } from "../src/db/index.js";
+import { agentRuns, approvals, caregivers, commsLog, offers, shifts } from "../src/db/schema.js";
 import { app } from "../src/gateway.js";
-import { GRAPHS } from "../src/graphs/index.js";
-import { runUntilIdle } from "../src/runtime.js";
-import { seed } from "../src/seed.js";
+import { getGraph } from "../src/graphs/index.js";
+import { AGENCY_PHONE, seed } from "../src/seed.js";
+import { retryFailedJobsNow, runUntilIdle } from "../src/tasks.js";
 
 export const T0 = new Date("2026-11-24T06:00:00Z");   // 6am UTC, the day before the seeded shifts
-export const bus = new InMemoryBus();
 let msgSeq = 0;
 
 export const PHONE = {
@@ -19,24 +19,27 @@ export const PHONE = {
 
 export async function reset() {
   clock.freeze(T0);
-  bus.popAll();
   await seed();
 }
 
-/** Let every queued job run until the system is quiet. Returns errors that happened. */
-export const settle = () => runUntilIdle(bus);
+/** Run every ready job until the system is quiet. Returns errors that happened. */
+export const settle = (concurrency = 1) => runUntilIdle(concurrency);
+/** Failed jobs back off for seconds; in tests, make them due now and settle again. */
+export async function retryAndSettle() {
+  await retryFailedJobsNow();
+  return settle();
+}
 
 export async function post(path: string, body: unknown) {
   const res = await app.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   return { status: res.status, body: (await res.json()) as any };
 }
-
 export async function get(path: string) {
   return (await (await app.request(path)).json()) as any;
 }
 
 export async function nurseTexts(phone: string, body: string, messageId = `m${++msgSeq}`) {
-  return (await post("/webhooks/sms", { from: phone, body, messageId })).body;
+  return (await post("/webhooks/sms", { from: phone, to: AGENCY_PHONE, body, messageId })).body;
 }
 
 export async function decide(approvalId: number, action: string, extra: Record<string, unknown> = {}) {
@@ -44,7 +47,8 @@ export async function decide(approvalId: number, action: string, extra: Record<s
 }
 
 export const smsTo = (phone: string) =>
-  q<{ body: string; channel: string }>(`SELECT body, channel FROM comms_log WHERE phone = $1 AND direction = 'out' ORDER BY id`, [phone]);
+  db.select({ body: commsLog.body, channel: commsLog.channel, meta: commsLog.meta }).from(commsLog)
+    .where(and(eq(commsLog.phone, phone), eq(commsLog.direction, "out"))).orderBy(asc(commsLog.id));
 
 export async function lastMessageTo(phone: string) {
   const all = await smsTo(phone);
@@ -52,14 +56,17 @@ export async function lastMessageTo(phone: string) {
 }
 
 export const offerCode = async (threadId: string, caregiverId: string) =>
-  (await one(`SELECT code FROM offers WHERE thread_id = $1 AND caregiver_id = $2`, [threadId, caregiverId]))?.code as string;
+  (await db.select().from(offers).where(and(eq(offers.threadId, threadId), eq(offers.caregiverId, caregiverId))))[0]?.code as string;
 
-export const pendingApprovals = () => q(`SELECT * FROM approvals WHERE status = 'pending' ORDER BY id`);
-export const run = (threadId: string) => one(`SELECT * FROM agent_runs WHERE thread_id = $1`, [threadId]);
-export const shift = (id: string) => one(`SELECT * FROM shifts WHERE id = $1`, [id]);
+export const pendingApprovals = () => db.select().from(approvals).where(eq(approvals.status, "pending")).orderBy(asc(approvals.id));
+export const run = async (threadId: string) => (await db.select().from(agentRuns).where(eq(agentRuns.threadId, threadId)))[0];
+export const shift = async (id: string) => (await db.select().from(shifts).where(eq(shifts.id, id)))[0];
+export const hours = async (id: string) => (await db.select().from(caregivers).where(eq(caregivers.id, id)))[0].hoursThisWeek;
+export const runs = (graph: string) => db.select().from(agentRuns).where(eq(agentRuns.graph, graph));
 
-export async function threadLog(threadId: string, graph: "intake" | "shiftfill" = "shiftfill") {
-  const snap = await GRAPHS[graph].getState({ configurable: { thread_id: threadId } });
+export async function threadLog(threadId: string) {
+  const r = await run(threadId);
+  const snap = await getGraph(r.graph, r.graphVersion).getState({ configurable: { thread_id: threadId } });
   return ((snap.values as any).log ?? []) as string[];
 }
 

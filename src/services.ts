@@ -1,65 +1,33 @@
-// Run the whole system "for real": RabbitMQ consumers + outbox relay + scheduler + HTTP gateway.
+// Run the system "for real":
+//   npm run services            # gateway + workers (+ cron) in one process
+//   npm run services worker     # only graphile-worker: thread/memory jobs + cron (scale horizontally)
+//   npm run services gateway    # only the HTTP gateway + console on :3000
 //
-//   npm run services            # everything in one process (simplest)
-//   npm run services worker     # only agent + memory workers (scale these horizontally)
-//   npm run services relay      # only the outbox relay
-//   npm run services scheduler  # only timers / SLA / reaper / consolidation
-//   npm run services gateway    # only the HTTP gateway + UI on :3000
-//
-// In production each role is its own deployment; they share nothing but Postgres and RabbitMQ.
+// Everything coordinates through Postgres: the gateway writes mailbox rows + jobs in one transaction,
+// any number of worker processes pick jobs up (one at a time per thread, thanks to named queues).
 
 import { serve } from "@hono/node-server";
-import { RabbitBus } from "./bus.js";
-import { pool } from "./db.js";
+import { pool } from "./db/index.js";
 import { app } from "./gateway.js";
-import { setupLangGraphTables } from "./graphs/index.js";
+import { log } from "./log.js";
 import { getMemoryStore } from "./memory.js";
-import { enqueue, relayOnce } from "./outbox.js";
-import { dispatch } from "./runtime.js";
-import { AGENCY } from "./seed.js";
-import { escalateStaleApprovals, fireDueTimers, reapDeadRuns } from "./timers.js";
-import { onDeadJob } from "./worker.js";
+import { setupAll } from "./seed.js";
+import { startWorker } from "./tasks.js";
 
 const role = process.argv[2] ?? "all";
-const want = (r: string) => role === "all" || role === r;
-const loops: NodeJS.Timeout[] = [];
+await setupAll();
 
-/** setInterval that never overlaps itself and never crashes the process. */
-function every(ms: number, name: string, fn: () => Promise<unknown>) {
-  let busy = false;
-  loops.push(setInterval(async () => {
-    if (busy) return;
-    busy = true;
-    try { await fn(); } catch (e) { console.error(`[${name}]`, e); } finally { busy = false; }
-  }, ms));
-}
+const runner = role === "all" || role === "worker" ? await startWorker(10) : null;
+if (runner) log.info("worker: thread_kick + memory jobs, cron: timers_tick (1m), consolidate_all (1h), checkpoint_retention (daily)");
 
-await setupLangGraphTables();
-const bus = new RabbitBus();
-await bus.setup(5);
-
-if (want("worker")) {
-  await bus.consume("agent.jobs", dispatch, onDeadJob);
-  await bus.consume("memory.jobs", dispatch, onDeadJob);
-  console.log("[worker] consuming agent.jobs + memory.jobs");
-}
-if (want("relay")) {
-  every(200, "relay", () => relayOnce(bus));                       // could also use LISTEN/NOTIFY to cut latency
-  console.log("[relay] outbox -> RabbitMQ every 200ms");
-}
-if (want("scheduler")) {
-  every(1000, "timers", async () => { await fireDueTimers(); await escalateStaleApprovals(); await reapDeadRuns(); });
-  every(60 * 60 * 1000, "consolidate", () => enqueue("memory.consolidate", { agencyId: AGENCY }));
-  console.log("[scheduler] timers / approval SLA / reaper every 1s, memory consolidation hourly");
-}
-if (want("gateway")) {
-  serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) });
-  console.log(`[gateway] http://localhost:${process.env.PORT ?? 3000}`);
+if (role === "all" || role === "gateway") {
+  const port = Number(process.env.PORT ?? 3000);
+  serve({ fetch: app.fetch, port });
+  log.info(`gateway: http://localhost:${port}`);
 }
 
 process.on("SIGINT", async () => {
-  loops.forEach(clearInterval);
-  await bus.close();
+  await runner?.stop();             // graceful: finish in-flight jobs, release locks
   await getMemoryStore().stop();
   await pool.end();
   process.exit(0);

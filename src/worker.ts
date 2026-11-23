@@ -1,153 +1,169 @@
-// AGENT WORKER: turns "thread.kick" jobs into LangGraph runs.
+// AGENT WORKER: runs one thread's mailbox. Called by the "thread_kick" job.
 //
-// processThread(threadId):
-//   1. take a per-thread Postgres ADVISORY LOCK (no two workers ever run the same thread;
-//      if the worker dies, its DB session ends and the lock is released automatically)
-//   2. DRAIN THE MAILBOX:
-//        no checkpoint yet          -> invoke(startInput)
-//        paused at an interrupt     -> pick the oldest pending event whose kind the interrupt
-//                                      `accepts` -> invoke(new Command({ resume: event }))
-//                                      (events it doesn't accept stay BUFFERED, e.g. a nurse
-//                                      text arriving while a human approval is pending)
-//        has pending tasks          -> it crashed mid-run -> invoke(null) resumes from the last checkpoint
-//        finished                   -> remaining events are ignored
-//   3. after each run, record what the thread now waits on (agent_runs) and, for human
-//      interrupts, create a row in the approvals inbox.
+// graphile-worker runs all jobs of queue "thread:<id>" one at a time, so two workers never run
+// the same thread concurrently. On top of that we take a LEASE (lease_version = fencing token)
+// so a zombie worker can't overwrite control-plane state after the reaper reassigned the thread.
+//
+// THE CHECKPOINT IS THE SOURCE OF TRUTH. Everything else is derived from it on EVERY pass:
+//   reconcileInflight(): an event handed to the graph is "consumed" iff the checkpoint moved past
+//                        the interrupt it resumed; otherwise it goes back to "pending" (retry).
+//   project():           agent_runs.status / waiting_for and the approvals inbox are rebuilt from the
+//                        current interrupt. A crash between invoke() and these writes self-heals on
+//                        the next drain - there is no "after a clean run" step to miss.
+//
+// drain loop:
+//   no checkpoint yet        -> invoke(start input)
+//   paused at an interrupt   -> oldest pending event whose kind the interrupt `accepts`
+//                               -> invoke(Command({ resume: event }))   (others stay BUFFERED)
+//   has next tasks, no pause -> it crashed mid-run -> invoke(null) continues from the last checkpoint
+//   finished / failed        -> close leftovers
 
 import { Command } from "@langchain/langgraph";
-import { RetryLater } from "./bus.js";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { clock } from "./clock.js";
-import { one, pool, q } from "./db.js";
-import { GRAPHS, type GraphName } from "./graphs/index.js";
-import { SimulatedCrash } from "./faults.js";
+import { db } from "./db/index.js";
+import { agentRuns, approvals, shifts, threadInbox } from "./db/schema.js";
+import { maybeCrash } from "./faults.js";
+import { getGraph } from "./graphs/index.js";
+import { addJob } from "./jobs.js";
+import { log } from "./log.js";
+import { deliver } from "./mailbox.js";
 import { callTool } from "./tools.js";
 
 const HUMAN_INTERRUPTS = new Set(["approval", "escalation", "triage_review", "review_outbound", "emergency_ack"]);
+export class LostLease extends Error {}
 
+type View = {
+  started: boolean;
+  interrupt?: { id: string; value: { type: string; accepts: string[]; [k: string]: any } };
+  hasNext: boolean;
+  finished: boolean;
+};
+type Run = typeof agentRuns.$inferSelect;
+type Event = typeof threadInbox.$inferSelect;
 
-export async function processThread(threadId: string) {
-  const lockConn = await pool.connect();
-  try {
-    const { rows } = await lockConn.query(`SELECT pg_try_advisory_lock(hashtext($1)) AS ok`, [threadId]);
-    if (!rows[0].ok) throw new RetryLater(`thread ${threadId} is busy`);   // another worker has it -> retry later
-    try {
-      await drainMailbox(threadId);
-    } finally {
-      await lockConn.query(`SELECT pg_advisory_unlock(hashtext($1))`, [threadId]);
-    }
-  } finally {
-    lockConn.release();
-  }
+async function viewOf(run: Run): Promise<View> {
+  const snap = await getGraph(run.graph, run.graphVersion).getState({ configurable: { thread_id: run.threadId } });
+  const started = Boolean(snap.config?.configurable?.checkpoint_id);
+  const interrupt = snap.tasks.flatMap((t: any) => t.interrupts ?? [])[0];
+  return { started, interrupt, hasNext: snap.next.length > 0, finished: started && snap.next.length === 0 };
 }
 
-async function nextEvent(threadId: string, kinds: string[]) {
-  return one(
-    `SELECT * FROM thread_inbox WHERE thread_id = $1 AND status = 'pending' AND kind = ANY($2) ORDER BY id LIMIT 1`,
-    [threadId, kinds],
-  );
-}
-const markEvent = (id: string, status: string, note: string | null = null) =>
-  q(`UPDATE thread_inbox SET status = $2, note = $3, consumed_at = now() WHERE id = $1`, [id, status, note]);
+export async function processThread(threadId: string, workerId = "local") {
+  // Take the lease: bump the fencing token. Every control-plane write below is conditional on it.
+  const [lease] = await db.update(agentRuns)
+    .set({ leaseOwner: workerId, leaseVersion: sql`${agentRuns.leaseVersion} + 1`, heartbeatAt: clock.now() })
+    .where(eq(agentRuns.threadId, threadId)).returning();
+  if (!lease) return;
+  const fence = lease.leaseVersion;
 
-const pendingInterrupt = (snap: any) => snap.tasks.flatMap((t: any) => t.interrupts ?? [])[0] as { id: string; value: any } | undefined;
-
-async function drainMailbox(threadId: string) {
   for (let step = 0; step < 100; step++) {
-    const run = await one(`SELECT * FROM agent_runs WHERE thread_id = $1`, [threadId]);
-    if (!run) return;
-    const graph = GRAPHS[run.graph as GraphName];
-    const cfg = { configurable: { thread_id: threadId } };
-    const snap = await graph.getState(cfg);
-    const started = Boolean(snap.config?.configurable?.checkpoint_id);
-
-    if (run.status === "done" || run.status === "failed") return ignoreLeftovers(threadId, run.status);
+    const [run] = await db.select().from(agentRuns).where(eq(agentRuns.threadId, threadId));
+    if (run.leaseVersion !== fence) throw new LostLease(threadId);
+    const view = await viewOf(run);
+    await reconcileInflight(threadId, view);
+    await project(run, view, fence);
+    if (run.status === "failed" || view.finished) return closeLeftovers(run);
 
     let input: unknown;
-    let event: any = null;
-    const intr = started ? pendingInterrupt(snap) : undefined;
-
-    if (!started) {
+    let event: Event | undefined;
+    if (!view.started) {
       event = await nextEvent(threadId, ["start"]);
       if (!event) return;
       input = event.payload;
-    } else if (intr) {
-      event = await nextEvent(threadId, intr.value.accepts);
-      if (!event) return;                                     // nothing it can use yet -> stay paused
+    } else if (view.interrupt) {
+      event = await nextEvent(threadId, view.interrupt.value.accepts);
+      if (!event) return;                                           // nothing it can use yet -> stay paused
       // STALE-DECISION GUARD: a human decision only applies to the interrupt it was made for.
-      if (event.kind === "human_decision" && event.payload.interruptId !== intr.id) {
-        await markEvent(event.id, "stale", "decision was for an older interrupt");
+      if (event.kind === "human_decision" && event.payload.interruptId !== view.interrupt.id) {
+        await setEvent(event.id, "stale", "decision was for an older interrupt");
         continue;
       }
       input = new Command({ resume: { id: String(event.id), kind: event.kind, payload: event.payload } });
-    } else if (snap.next.length) {
-      input = null;                                           // crash recovery: continue from last checkpoint
     } else {
-      await q(`UPDATE agent_runs SET status = 'done', waiting_for = NULL, updated_at = now() WHERE thread_id = $1`, [threadId]);
-      continue;
+      input = null;                                                 // crash recovery: continue from last checkpoint
     }
 
-    await q(`UPDATE agent_runs SET status = 'running', heartbeat_at = $2, updated_at = now() WHERE thread_id = $1`, [threadId, clock.now()]);
-    const beat = setInterval(() => void q(`UPDATE agent_runs SET heartbeat_at = now() WHERE thread_id = $1`, [threadId]), 10_000);
+    if (event) {
+      await db.update(threadInbox).set({ status: "inflight", resumedInterruptId: view.interrupt?.id ?? "start" }).where(eq(threadInbox.id, event.id));
+    }
+    await db.update(agentRuns).set({ status: "running", heartbeatAt: clock.now(), error: null })
+      .where(and(eq(agentRuns.threadId, threadId), eq(agentRuns.leaseVersion, fence)));
+    log.info({ threadId, event: event?.kind }, "invoke");
+    const beat = setInterval(() => void db.update(agentRuns).set({ heartbeatAt: clock.now() }).where(eq(agentRuns.threadId, threadId)), 10_000);
     try {
-      // durability "sync": the checkpoint is written before the next step starts -> safest for long-running work
-      await graph.invoke(input as any, { ...cfg, durability: "sync" });
-    } catch (e) {
-      if (event) await markIfApplied(graph, cfg, event, intr?.id);
-      if (e instanceof SimulatedCrash) throw e;               // "process died": leave status = running for the reaper
-      await q(`UPDATE agent_runs SET status = 'queued', error = $2, updated_at = now() WHERE thread_id = $1`, [threadId, String(e)]);
-      throw e;                                                // the bus retries with backoff, then DLQ
+      // durability "sync": every checkpoint is written before the next step starts
+      await getGraph(run.graph, run.graphVersion).invoke(input as any, { configurable: { thread_id: threadId }, durability: "sync" });
     } finally {
       clearInterval(beat);
     }
-    if (event) await markEvent(event.id, "consumed");
-    await recordWaitState(threadId, run, graph, cfg);
+    maybeCrash("worker.after_invoke");   // tests: die before ANY bookkeeping -> the next drain must repair it
   }
 }
 
-/** If the run failed AFTER the event was applied (checkpoint moved past it), don't re-deliver it. */
-async function markIfApplied(graph: any, cfg: any, event: any, interruptId?: string) {
-  const snap = await graph.getState(cfg);
-  const now = pendingInterrupt(snap);
-  const applied = event.kind === "start" ? Boolean(snap.config?.configurable?.checkpoint_id) : now?.id !== interruptId;
-  if (applied) await markEvent(event.id, "consumed", "applied before failure");
-}
+const nextEvent = async (threadId: string, kinds: string[]) =>
+  (await db.select().from(threadInbox)
+    .where(and(eq(threadInbox.threadId, threadId), eq(threadInbox.status, "pending"), inArray(threadInbox.kind, kinds as Event["kind"][])))
+    .orderBy(threadInbox.id).limit(1))[0];
 
-async function recordWaitState(threadId: string, run: any, graph: any, cfg: any) {
-  const snap = await graph.getState(cfg);
-  const intr = pendingInterrupt(snap);
-  if (!intr) {
-    if (!snap.next.length) await q(`UPDATE agent_runs SET status = 'done', waiting_for = NULL, updated_at = now() WHERE thread_id = $1`, [threadId]);
-    return;
-  }
-  const human = HUMAN_INTERRUPTS.has(intr.value.type);
-  await q(`UPDATE agent_runs SET status = $2, waiting_for = $3, error = NULL, updated_at = now() WHERE thread_id = $1`,
-    [threadId, human ? "waiting_human" : "waiting_event", intr.value.type]);
-  if (human) {
-    // HITL inbox row. interrupt_id is UNIQUE -> re-running this is harmless.
-    await q(
-      `INSERT INTO approvals (thread_id, interrupt_id, kind, payload, created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (interrupt_id) DO NOTHING`,
-      [threadId, intr.id, intr.value.type, intr.value, clock.now()],
-    );
+const setEvent = (id: number, status: Event["status"], note: string | null = null) =>
+  db.update(threadInbox).set({ status, note }).where(eq(threadInbox.id, id));
+
+/** inflight -> consumed if the checkpoint moved past the interrupt it resumed, else back to pending. */
+async function reconcileInflight(threadId: string, view: View) {
+  const inflight = await db.select().from(threadInbox).where(and(eq(threadInbox.threadId, threadId), eq(threadInbox.status, "inflight")));
+  for (const ev of inflight) {
+    const applied = ev.resumedInterruptId === "start" ? view.started : view.interrupt?.id !== ev.resumedInterruptId;
+    await setEvent(ev.id, applied ? "consumed" : "pending", applied ? null : "retrying: not applied before failure");
   }
 }
 
-async function ignoreLeftovers(threadId: string, status: string) {
-  const left = await q(`UPDATE thread_inbox SET status = 'ignored', note = $2, consumed_at = now()
-                        WHERE thread_id = $1 AND status = 'pending' RETURNING *`, [threadId, `thread ${status}`]);
+/** Rebuild agent_runs + approvals from the checkpoint. Idempotent, fenced. */
+async function project(run: Run, view: View, fence: number) {
+  const human = view.interrupt && HUMAN_INTERRUPTS.has(view.interrupt.value.type);
+  const status: Run["status"] = run.status === "failed" ? "failed"
+    : view.finished ? "done"
+    : view.interrupt ? (human ? "waiting_human" : "waiting_event")
+    : "queued";
+  await db.transaction(async (tx) => {
+    await tx.update(agentRuns).set({ status, waitingFor: view.interrupt?.value.type ?? null })
+      .where(and(eq(agentRuns.threadId, run.threadId), eq(agentRuns.leaseVersion, fence)));
+    if (human) {
+      await tx.insert(approvals).values({
+        agencyId: run.agencyId, threadId: run.threadId, interruptId: view.interrupt!.id,
+        kind: view.interrupt!.value.type as any, payload: view.interrupt!.value, createdAt: clock.now(),
+      }).onConflictDoNothing();
+    }
+    // approvals for interrupts the thread is no longer paused at can't be acted on any more
+    const closed = view.finished || status === "failed" ? "cancelled" : "stale";
+    await tx.update(approvals).set({ status: closed })
+      .where(and(eq(approvals.threadId, run.threadId), eq(approvals.status, "pending"), ne(approvals.interruptId, view.interrupt?.id ?? "")));
+  });
+}
+
+async function closeLeftovers(run: Run) {
+  const left = await db.update(threadInbox).set({ status: "ignored", note: `thread ${run.status}` })
+    .where(and(eq(threadInbox.threadId, run.threadId), eq(threadInbox.status, "pending"))).returning();
+  if (run.status === "failed") return;          // a human owns the shift now: don't tell nurses anything misleading
   for (const ev of left) {
-    if (ev.kind !== "nurse_reply") continue;   // be polite to late repliers
-    const cg = await one(`SELECT phone, name FROM caregivers WHERE id = $1`, [ev.payload.caregiverId]);
-    if (cg) await callTool("comms.send_sms", { to: cg.phone, body: `Thanks ${cg.name.split(" ")[0]}! That shift is no longer available.` },
-      { threadId, idempotencyKey: `${threadId}:late:${ev.id}` });
+    if (ev.kind !== "nurse_reply") continue;
+    const [sh] = await db.select().from(shifts).where(eq(shifts.id, String(ev.payload.shiftId ?? "")));
+    const { caregiverId, phone, firstName } = ev.payload;
+    const body = sh?.caregiverId === caregiverId ? `You're all set, ${firstName} - you're booked for that shift.` : `Thanks ${firstName}! That shift is no longer available.`;
+    await callTool("comms.send_sms", { to: phone, body }, { agencyId: run.agencyId, threadId: run.threadId, idempotencyKey: `${run.threadId}:late:${ev.id}` });
   }
 }
 
-/** Called by the bus after MAX_JOB_ATTEMPTS: the run is failed and a human is paged (HITL for failures). */
-export async function onDeadJob(topic: string, payload: any, err: string) {
-  await q(`INSERT INTO dead_letters (topic, payload, error) VALUES ($1,$2,$3)`, [topic, payload, err]);
-  if (payload.threadId) {
-    await q(`UPDATE agent_runs SET status = 'failed', error = $2 WHERE thread_id = $1`, [payload.threadId, err]);
-    await callTool("ops.page_manager", { message: `Agent thread ${payload.threadId} FAILED: ${err.slice(0, 200)}` },
-      { threadId: payload.threadId, idempotencyKey: `dead:${payload.threadId}` });
-  }
+/** Last attempt failed: mark failed, close approvals, page a human, and tell the parent (fan-in must not hang). */
+export async function onThreadDead(threadId: string, err: string) {
+  await db.transaction(async (tx) => {
+    const [run] = await tx.update(agentRuns).set({ status: "failed", error: err.slice(0, 500) }).where(eq(agentRuns.threadId, threadId)).returning();
+    if (!run) return;
+    await tx.update(approvals).set({ status: "cancelled" }).where(and(eq(approvals.threadId, threadId), eq(approvals.status, "pending")));
+    await addJob(tx, "send_page", { agencyId: run.agencyId, threadId, key: `dead:${threadId}`, message: `Agent thread ${threadId} FAILED: ${err.slice(0, 200)}` });
+    if (run.parentThreadId) {
+      await deliver(tx, { agencyId: run.agencyId, threadId: run.parentThreadId, kind: "child_done",
+        payload: { childThreadId: threadId, shiftId: run.subject, outcome: "failed", caregiverId: null }, dedupeKey: `child_done:${threadId}` });
+    }
+  });
 }

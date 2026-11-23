@@ -1,4 +1,14 @@
-// Message bus: RabbitMQ in "production", an in-memory array in tests.
+// REFERENCE IMPLEMENTATION (not on the main path): the same job delivery done with
+// a transactional OUTBOX table + a relay + RabbitMQ, instead of graphile-worker.
+//
+// Main path today:  tx { mailbox row + graphile_worker.add_job(...) }      -> worker
+// This version:     tx { mailbox row + app.outbox row } -> relayOnce() -> RabbitMQ -> consumer
+//
+// When would you switch? When consumers aren't Postgres-centric (other teams, other languages
+// like Adalat's Go services), you need fan-out to many consumer types, or throughput outgrows
+// a Postgres queue. Then you need the outbox to avoid the dual-write problem:
+//   await db.update(shift); await rabbit.publish(job);  // crash in between -> job lost
+// and per-thread ordering has to come from a lock (or a Kafka partition key = threadId).
 //
 // RabbitMQ topology (RabbitBus.setup):
 //
@@ -17,8 +27,30 @@
 // the partition key; here we get per-thread ordering from a Postgres lock + mailbox.
 
 import amqp from "amqplib";
-import { MAX_JOB_ATTEMPTS, RABBITMQ_URL, RETRY_DELAY_MS } from "./config.js";
-import type { Bus } from "./outbox.js";
+import { asc, inArray, isNull, sql } from "drizzle-orm";
+import { MAX_JOB_ATTEMPTS, RABBITMQ_URL, RETRY_DELAY_MS } from "../config.js";
+import { db, type DbOrTx } from "../db/index.js";
+import { outbox } from "../db/schema.js";
+
+export interface Bus {
+  publish(topic: string, payload: unknown, messageId?: string): Promise<void>;
+}
+
+/** Write a message in the caller's transaction (atomic with the business change). */
+export async function enqueueOutbox(tx: DbOrTx, topic: string, payload: Record<string, unknown>) {
+  await tx.insert(outbox).values({ topic, payload });
+}
+
+/** Relay: publish unpublished rows. SKIP LOCKED -> many relays are safe. At-least-once:
+ *  a crash after publish but before COMMIT re-publishes -> consumers must be idempotent. */
+export async function relayOnce(bus: Bus, batch = 100): Promise<number> {
+  return db.transaction(async (tx) => {
+    const rows = await tx.select().from(outbox).where(isNull(outbox.publishedAt)).orderBy(asc(outbox.id)).limit(batch).for("update", { skipLocked: true });
+    for (const r of rows) await bus.publish(r.topic, r.payload, String(r.id));
+    if (rows.length) await tx.update(outbox).set({ publishedAt: sql`now()` }).where(inArray(outbox.id, rows.map((r) => r.id)));
+    return rows.length;
+  });
+}
 
 const EXCHANGE = "vali";
 export const QUEUES: Record<string, string> = { "agent.jobs": "thread.#", "memory.jobs": "memory.#" };

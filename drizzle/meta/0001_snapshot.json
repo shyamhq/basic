@@ -1,0 +1,1029 @@
+{
+  "id": "f49f686e-025e-4e98-8c24-c728b6629aad",
+  "prevId": "1b07de8c-f6c5-44e7-8bba-d001a71de2fc",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "app.agencies": {
+      "name": "agencies",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phone": {
+          "name": "phone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "review_outbound": {
+          "name": "review_outbound",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "agencies_phone_unique": {
+          "name": "agencies_phone_unique",
+          "columns": [
+            "phone"
+          ],
+          "nullsNotDistinct": false
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.agent_runs": {
+      "name": "agent_runs",
+      "schema": "app",
+      "columns": {
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "graph": {
+          "name": "graph",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "graph_version": {
+          "name": "graph_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subject": {
+          "name": "subject",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "parent_thread_id": {
+          "name": "parent_thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "waiting_for": {
+          "name": "waiting_for",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_owner": {
+          "name": "lease_owner",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_version": {
+          "name": "lease_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "heartbeat_at": {
+          "name": "heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error": {
+          "name": "error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "agent_runs_subject": {
+          "name": "agent_runs_subject",
+          "columns": [
+            {
+              "expression": "graph",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "with": {},
+          "method": "btree",
+          "concurrently": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.approvals": {
+      "name": "approvals",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigserial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "interrupt_id": {
+          "name": "interrupt_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "decision": {
+          "name": "decision",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decided_by": {
+          "name": "decided_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "escalated": {
+          "name": "escalated",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decided_at": {
+          "name": "decided_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "approvals_interrupt_id_unique": {
+          "name": "approvals_interrupt_id_unique",
+          "columns": [
+            "interrupt_id"
+          ],
+          "nullsNotDistinct": false
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.caregivers": {
+      "name": "caregivers",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phone": {
+          "name": "phone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "license": {
+          "name": "license",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "certs": {
+          "name": "certs",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "specialties": {
+          "name": "specialties",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "languages": {
+          "name": "languages",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "bio": {
+          "name": "bio",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "x": {
+          "name": "x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "y": {
+          "name": "y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "min_rate": {
+          "name": "min_rate",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "max_distance_mi": {
+          "name": "max_distance_mi",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "shift_prefs": {
+          "name": "shift_prefs",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "preferred_channel": {
+          "name": "preferred_channel",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'sms'"
+        },
+        "contact_start": {
+          "name": "contact_start",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 8
+        },
+        "contact_end": {
+          "name": "contact_end",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 21
+        },
+        "hours_this_week": {
+          "name": "hours_this_week",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reliability": {
+          "name": "reliability",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0.9
+        },
+        "active": {
+          "name": "active",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "caregivers_phone_unique": {
+          "name": "caregivers_phone_unique",
+          "columns": [
+            "phone"
+          ],
+          "nullsNotDistinct": false
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.comms_log": {
+      "name": "comms_log",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigserial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "channel": {
+          "name": "channel",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "direction": {
+          "name": "direction",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phone": {
+          "name": "phone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "body": {
+          "name": "body",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "meta": {
+          "name": "meta",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.facilities": {
+      "name": "facilities",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "x": {
+          "name": "x",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "y": {
+          "name": "y",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requirements": {
+          "name": "requirements",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.inbound_requests": {
+      "name": "inbound_requests",
+      "schema": "app",
+      "columns": {
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.offers": {
+      "name": "offers",
+      "schema": "app",
+      "columns": {
+        "code": {
+          "name": "code",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "shift_id": {
+          "name": "shift_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "caregiver_id": {
+          "name": "caregiver_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "wave": {
+          "name": "wave",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "channel": {
+          "name": "channel",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'sent'"
+        },
+        "last_event_id": {
+          "name": "last_event_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "offers_thread_id_caregiver_id_unique": {
+          "name": "offers_thread_id_caregiver_id_unique",
+          "columns": [
+            "thread_id",
+            "caregiver_id"
+          ],
+          "nullsNotDistinct": false
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.outbox": {
+      "name": "outbox",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigserial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "topic": {
+          "name": "topic",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "published_at": {
+          "name": "published_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.shifts": {
+      "name": "shifts",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "facility_id": {
+          "name": "facility_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "specialty": {
+          "name": "specialty",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "starts_at": {
+          "name": "starts_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ends_at": {
+          "name": "ends_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "rate": {
+          "name": "rate",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "max_rate": {
+          "name": "max_rate",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "caregiver_id": {
+          "name": "caregiver_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.thread_inbox": {
+      "name": "thread_inbox",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigserial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "dedupe_key": {
+          "name": "dedupe_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "resumed_interrupt_id": {
+          "name": "resumed_interrupt_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "note": {
+          "name": "note",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "inbox_open": {
+          "name": "inbox_open",
+          "columns": [
+            {
+              "expression": "thread_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "with": {},
+          "method": "btree",
+          "where": "status in ('pending','inflight')",
+          "concurrently": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "thread_inbox_dedupe_key_unique": {
+          "name": "thread_inbox_dedupe_key_unique",
+          "columns": [
+            "dedupe_key"
+          ],
+          "nullsNotDistinct": false
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.timers": {
+      "name": "timers",
+      "schema": "app",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "fire_at": {
+          "name": "fire_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fired_at": {
+          "name": "fired_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cancelled": {
+          "name": "cancelled",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        }
+      },
+      "indexes": {
+        "timers_due": {
+          "name": "timers_due",
+          "columns": [
+            {
+              "expression": "fire_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "with": {},
+          "method": "btree",
+          "where": "fired_at is null and not cancelled",
+          "concurrently": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "app.tool_calls": {
+      "name": "tool_calls",
+      "schema": "app",
+      "columns": {
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "agency_id": {
+          "name": "agency_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "tool": {
+          "name": "tool",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "args": {
+          "name": "args",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "result": {
+          "name": "result",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "approved_by": {
+          "name": "approved_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {
+    "app": "app"
+  },
+  "views": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
