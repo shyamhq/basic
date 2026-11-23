@@ -13,7 +13,8 @@
     "services": "tsx src/services.ts",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
-    "record": "tsx scripts/record-demo.ts"
+    "record": "tsx scripts/record-demo.ts",
+    "retell:setup": "tsx scripts/retell-setup.ts"
   },
   "repository": {
     "type": "git",
